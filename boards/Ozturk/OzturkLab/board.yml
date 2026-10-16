@@ -1,0 +1,6 @@
+board:
+  name: OzturkLab
+  full_name: OzturkLab
+  vendor: Ozturk
+  socs:
+    - name: nrf52840

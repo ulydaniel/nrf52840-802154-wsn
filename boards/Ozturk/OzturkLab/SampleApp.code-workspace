@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "../../../SampleApp"
+		},
+		{
+			"name": "SampleBlinkLed",
+			"path": "../../../SampleBlinkLed"
+		},
+		{
+			"name": "SampleBluetoothBeacon",
+			"path": "../../../SampleBluetoothBeacon"
+		}
+	],
+	"settings": {
+		"nrf-connect.applications": [
+			"/Users/yozturk/Documents/GitHub/COMPE662Fall2026/SampleBluetoothBeacon"
+		]
+	}
+}

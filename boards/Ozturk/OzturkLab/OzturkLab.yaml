@@ -1,0 +1,10 @@
+identifier: OzturkLab/nrf52840
+name: OzturkLab Sensor Board
+vendor: Ozturk
+type: mcu
+arch: arm
+ram: 256
+flash: 472
+toolchain:
+  - zephyr
+supported: []

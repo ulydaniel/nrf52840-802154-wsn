@@ -1,0 +1,11 @@
+/*
+ * Enable the SAADC so the heartbeat can report battery level
+ * (VDD measured through the SAADC internal VDD input).
+ * The channel is configured at runtime in main.c.
+ *
+ * Added through EXTRA_DTC_OVERLAY_FILE in CMakeLists.txt.
+ */
+
+&adc {
+	status = "okay";
+};

@@ -1,0 +1,13 @@
+# nRF Connect / west build output (root only; boards/Ozturk/OzturkLab is source)
+/OzturkLab/
+/build/
+/build_*/
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+*.bak
+*.tmp
