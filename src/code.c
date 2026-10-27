@@ -130,6 +130,14 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define RX_QUEUE_DEPTH           4
 #define RX_WAIT_TIMEOUT_SECONDS  5
 
+/*
+ * Upper bound on net_context_sendto() waiting for a network
+ * buffer. Sends also run in the RX thread (PROBE -> HEARTBEAT
+ * reply), and K_FOREVER there would stop receive_queue from
+ * being drained.
+ */
+#define TX_SEND_TIMEOUT_MS       100
+
 enum node_state {
     STATE_IDLE,
     STATE_WAITING_FOR_HEARTBEAT,
@@ -148,11 +156,16 @@ enum node_state {
 #define RX_PRIORITY 5
 #define TX_PRIORITY 5
 
-K_THREAD_STACK_DEFINE(rx_stack, RX_STACK_SIZE);
-K_THREAD_STACK_DEFINE(tx_stack, TX_STACK_SIZE);
+/*
+ * Static and app_-prefixed: the network stack's net_tc.c
+ * already defines global rx_stack / tx_stack symbols.
+ */
+static K_THREAD_STACK_DEFINE(app_rx_stack, RX_STACK_SIZE);
+static K_THREAD_STACK_DEFINE(app_tx_stack, TX_STACK_SIZE);
 
-static struct k_thread rx_thread;
-static struct k_thread tx_thread;
+static struct k_thread app_rx_thread;
+static struct k_thread app_tx_thread;
+
 /*
  * Probe protocol message types. Values are contiguous so
  * (type - MSG_TYPE_FIRST) indexes message_handlers[].
@@ -338,9 +351,9 @@ static uint16_t tx_sequence = 1;
 
 
 /*
- * Probe state. Only the sender originates probes. It is
- * owned by the main thread, which also runs the message
- * handlers, so no locking is needed.
+ * Probe state. Only the sender originates probes. Written by
+ * the TX thread (run_probe_sender) and the RX thread
+ * (handle_heartbeat), so every access holds probe_state_mutex.
  */
 static unsigned int probe_k_seconds = PROBE_K_INITIAL_SECONDS;
 static uint16_t probe_outstanding_sequence;
@@ -1123,7 +1136,7 @@ static __maybe_unused int send_oz_packet(
 			(const struct sockaddr *)&destination,
 			sizeof(destination),
 			NULL,
-			K_FOREVER,
+			K_MSEC(TX_SEND_TIMEOUT_MS),
 			NULL
 		);
 
@@ -1227,7 +1240,7 @@ static int send_oz_packet_with_body(
 		(const struct sockaddr *)&destination,
 		sizeof(destination),
 		NULL,
-		K_FOREVER,
+		K_MSEC(TX_SEND_TIMEOUT_MS),
 		NULL
 	);
 
@@ -1548,12 +1561,12 @@ static void build_packet(
  * Message handlers
  *
  * Every handler has the same signature so it can be stored
- * in message_handlers[]. Handlers run in the main thread.
+ * in message_handlers[]. Handlers run in the RX thread.
  * ========================================================= */
 
 typedef void (*message_handler_t)(
 	const struct oz_packet *packet,
-	const struct received_frame );
+	const struct received_frame *frame);
 
 
 /*
@@ -1717,14 +1730,14 @@ static void handle_probe(
     probe_k_seconds = PROBE_K_INITIAL_SECONDS;
 
     /*
-     * Release the mutex before waking the TX thread.
-     */
-    k_mutex_unlock(&probe_state_mutex);
-
-    /*
-     * Notify the TX thread that the HEARTBEAT arrived.
+     * Give inside the lock: if the give happened after the
+     * unlock, the TX thread could open the next probe (and
+     * reset the semaphore) first, and this give would then
+     * satisfy the new probe's wait. k_sem_give() never blocks.
      */
     k_sem_give(&heartbeat_sem);
+
+    k_mutex_unlock(&probe_state_mutex);
 
     LOG_INF(
         "HEARTBEAT seq=%u from 0x%04X accepted",
@@ -1745,7 +1758,7 @@ static void handle_probe(
 }
 
 
-static void handle_heartbeatold(
+static __maybe_unused void handle_heartbeatold(
 	const struct oz_packet *packet,
 	const struct received_frame *frame)
 {
@@ -1929,40 +1942,19 @@ static void process_frame(const struct received_frame *frame)
  * ========================================================= */
 
 
-static void run_probe_sender_old(void)
-{
-	struct received_frame frame;
-	k_ticks_t remaining;
-	int ret;
-
-	LOG_INF("Probe sender started");
-	LOG_INF("Destination = 0x%04X", RECEIVER_ADDR);
-	LOG_INF(
-		"K = %u s, N = %u s, K max = %u s",
-		PROBE_K_INITIAL_SECONDS,
-		PROBE_N_INCREMENT_SECONDS,
-		PROBE_K_MAX_SECONDS
-	);
-
-	k_timer_start(&probe_timer, K_SECONDS(probe_k_seconds), K_NO_WAIT);
-
-	while (1) {
-        /*
-         * Sleep until the timer expires.
-         * This does not consume CPU while waiting.
-         */
-        k_timer_status_sync(&probe_timer);
-
-        /*
-         * Sends the probe and restarts the timer.
-         */
-        probe_timer_expired();
-    }
-}
 static void run_probe_sender(void)
 {
     struct oz_packet probe;
     int ret;
+
+    LOG_INF("Probe sender started");
+    LOG_INF("Destination = 0x%04X", RECEIVER_ADDR);
+    LOG_INF(
+        "K = %u s, N = %u s, K max = %u s",
+        PROBE_K_INITIAL_SECONDS,
+        PROBE_N_INCREMENT_SECONDS,
+        PROBE_K_MAX_SECONDS
+    );
 
     while (1) {
         build_packet(
@@ -1975,12 +1967,19 @@ static void run_probe_sender(void)
 
         /*
          * Mark the probe as outstanding before sending.
+         *
+         * A HEARTBEAT for the previous probe can arrive just
+         * after its k_sem_take() timed out and give the
+         * semaphore. Reset it under the same lock that opens
+         * the new probe so that stale give cannot satisfy the
+         * wait below.
          */
         k_mutex_lock(&probe_state_mutex, K_FOREVER);
 
         probe_outstanding = true;
         probe_outstanding_sequence = probe.sequence;
-        
+        k_sem_reset(&heartbeat_sem);
+
         k_mutex_unlock(&probe_state_mutex);
 
         ret = send_oz_packet(
@@ -2431,9 +2430,9 @@ int main(void)
 	}
 
     k_thread_create(
-        &rx_thread,
-        rx_stack,
-        K_THREAD_STACK_SIZEOF(rx_stack),
+        &app_rx_thread,
+        app_rx_stack,
+        K_THREAD_STACK_SIZEOF(app_rx_stack),
         rx_thread_entry,
         NULL,
         NULL,
@@ -2444,9 +2443,9 @@ int main(void)
     );
 
     k_thread_create(
-        &tx_thread,
-        tx_stack,
-        K_THREAD_STACK_SIZEOF(tx_stack),
+        &app_tx_thread,
+        app_tx_stack,
+        K_THREAD_STACK_SIZEOF(app_tx_stack),
         tx_thread_entry,
         NULL,
         NULL,
