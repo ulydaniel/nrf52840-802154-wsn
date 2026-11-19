@@ -13,10 +13,17 @@
  * addresses 1:1 .. 1:253 dynamically through the join protocol
  * (not yet implemented; see documentation/ASSIGNMENT_CHECKLIST.md).
  *
- * Transitional probe / heartbeat (until join FSM lands):
+ * Node FSM (assignment §5):
  *
- *      Joining (unassigned)  --PROBE broadcast-->  Root (1:254)
- *      Joining (unassigned)  <-HEARTBEAT---------  Root (1:254)
+ *      UNREGISTERED → PROBING → WAITING_FOR_JOIN_RESPONSE → REGISTERED
+ *
+ *      Root boots already REGISTERED at 1:254.
+ *      Joining nodes boot UNREGISTERED, then enter PROBING.
+ *
+ * Transitional probe / heartbeat (join REQUEST/RESPONSE still pending):
+ *
+ *      Joining (PROBING)  --PROBE broadcast-->  Root (REGISTERED)
+ *      Joining (PROBING)  <-HEARTBEAT---------  Root (REGISTERED)
  *
  *      Joining node: every K seconds a PROBE is broadcast.
  *      If no HEARTBEAT arrives before the next expiry, K grows
@@ -285,19 +292,46 @@ struct heartbeat_body {
 
 
 /* =========================================================
- * Role → boot address
+ * Node finite-state machine (assignment §5)
  *
- * Root discovery is assumed complete: root starts at 1:254.
- * Every other node boots unassigned until join succeeds.
+ * UNREGISTERED → PROBING → WAITING_FOR_JOIN_RESPONSE → REGISTERED
+ *
+ * Root boots REGISTERED. Joining nodes boot UNREGISTERED and
+ * enter PROBING once the radio is up (see node_fsm_init).
+ * ========================================================= */
+
+enum node_state {
+	NODE_UNREGISTERED = 0,
+	NODE_PROBING,
+	NODE_WAITING_FOR_JOIN_RESPONSE,
+	NODE_REGISTERED,
+};
+
+/* Hop count used when the node has no route toward the root. */
+#define HOP_COUNT_UNKNOWN        0xFF
+
+
+/* =========================================================
+ * Role → boot address and boot state
+ *
+ * Root discovery is assumed complete: root starts at 1:254
+ * already REGISTERED. Every other node boots unassigned and
+ * UNREGISTERED until join succeeds.
  * ========================================================= */
 
 #if NODE_ROLE == ROLE_ROOT
 
 #define BOOT_ADDRESS         ROOT_ADDRESS
+#define BOOT_NODE_STATE      NODE_REGISTERED
+#define BOOT_PARENT_ADDRESS  ROOT_ADDRESS
+#define BOOT_HOP_COUNT       0
 
 #elif NODE_ROLE == ROLE_JOINING
 
 #define BOOT_ADDRESS         UNASSIGNED_ADDRESS
+#define BOOT_NODE_STATE      NODE_UNREGISTERED
+#define BOOT_PARENT_ADDRESS  UNASSIGNED_ADDRESS
+#define BOOT_HOP_COUNT       HOP_COUNT_UNKNOWN
 
 #else
 
@@ -319,6 +353,15 @@ static struct net_if *iface;
  * will install the join-assigned value and push it to L2.
  */
 static uint16_t local_address = BOOT_ADDRESS;
+
+/*
+ * Protocol FSM state and registration context.
+ * parent_address / hop_count are meaningful once REGISTERED
+ * (and while WAITING_FOR_JOIN_RESPONSE after a parent is chosen).
+ */
+static enum node_state current_state = BOOT_NODE_STATE;
+static uint16_t parent_address = BOOT_PARENT_ADDRESS;
+static uint8_t hop_count = BOOT_HOP_COUNT;
 
 static int packet_socket = -1;
 
@@ -521,8 +564,8 @@ static int ieee802154_apply_short_address(uint16_t addr)
  * Returns 0 on success. On L2 failure, local_address is left
  * unchanged.
  *
- * Called by the join path once a JOIN_RESPONSE assigns an
- * address (Milestone 5). Marked maybe-unused until that lands.
+ * Called by node_enter_registered() / node_revert_to_unregistered()
+ * once join assigns or revokes an address (Milestone 5).
  */
 static int __maybe_unused set_local_address(uint16_t addr)
 {
@@ -545,6 +588,190 @@ static int __maybe_unused set_local_address(uint16_t addr)
 	);
 
 	return 0;
+}
+
+
+/* =========================================================
+ * Node FSM helpers
+ * ========================================================= */
+
+static const char *node_state_name(enum node_state state)
+{
+	switch (state) {
+	case NODE_UNREGISTERED:
+		return "UNREGISTERED";
+	case NODE_PROBING:
+		return "PROBING";
+	case NODE_WAITING_FOR_JOIN_RESPONSE:
+		return "WAITING_FOR_JOIN_RESPONSE";
+	case NODE_REGISTERED:
+		return "REGISTERED";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static void log_node_state(const char *title)
+{
+	LOG_INF(
+		"%s state=%s addr=%u:%u parent=%u:%u hop=%u",
+		title,
+		node_state_name(current_state),
+		(unsigned int)ADDRESS_NETWORK(local_address),
+		(unsigned int)ADDRESS_NODE(local_address),
+		(unsigned int)ADDRESS_NETWORK(parent_address),
+		(unsigned int)ADDRESS_NODE(parent_address),
+		(unsigned int)hop_count
+	);
+}
+
+/*
+ * Central transition point. Logs every change so serial demos
+ * can show the FSM progression required by the assignment.
+ */
+static void set_node_state(enum node_state next)
+{
+	if (current_state == next) {
+		return;
+	}
+
+	LOG_INF(
+		"STATE %s -> %s",
+		node_state_name(current_state),
+		node_state_name(next)
+	);
+
+	current_state = next;
+	log_node_state("FSM");
+}
+
+/* Normal DATA only after registration is complete. */
+static bool node_can_send_data(void)
+{
+	return (current_state == NODE_REGISTERED) &&
+	       !address_is_unassigned(local_address);
+}
+
+/* Discovery probes are owned by the PROBING state. */
+static bool node_can_send_probe(void)
+{
+	return current_state == NODE_PROBING;
+}
+
+/*
+ * Only registered nodes (root today; later also joined routers)
+ * answer probes with HEARTBEAT.
+ */
+static bool node_can_reply_heartbeat(void)
+{
+	return current_state == NODE_REGISTERED;
+}
+
+/*
+ * UNREGISTERED → PROBING. Clears any half-finished join context
+ * and starts listening/sending discovery traffic.
+ */
+static void node_enter_probing(void)
+{
+	parent_address = UNASSIGNED_ADDRESS;
+	hop_count = HOP_COUNT_UNKNOWN;
+	probe_outstanding = false;
+	probe_outstanding_sequence = 0;
+	probe_k_seconds = PROBE_K_INITIAL_SECONDS;
+
+	set_node_state(NODE_PROBING);
+}
+
+/*
+ * Join failure / give-up path: drop parent, restore unassigned
+ * address context, and return to UNREGISTERED. The caller may
+ * immediately call node_enter_probing() to retry.
+ */
+static void __maybe_unused node_revert_to_unregistered(void)
+{
+	parent_address = UNASSIGNED_ADDRESS;
+	hop_count = HOP_COUNT_UNKNOWN;
+	probe_outstanding = false;
+	probe_outstanding_sequence = 0;
+
+	if (!address_is_root(BOOT_ADDRESS) &&
+	    !address_is_unassigned(local_address)) {
+		/*
+		 * A previously assigned joining node that lost its
+		 * place must fall back to the unassigned short
+		 * address before probing again.
+		 */
+		(void)set_local_address(UNASSIGNED_ADDRESS);
+	}
+
+	set_node_state(NODE_UNREGISTERED);
+	log_node_state("Join failed; reverted");
+}
+
+/*
+ * PROBING → WAITING_FOR_JOIN_RESPONSE after parent selection.
+ * Join TX / timers land in a later milestone.
+ */
+static void __maybe_unused node_enter_waiting_for_join_response(
+	uint16_t selected_parent,
+	uint8_t parent_hop_count)
+{
+	parent_address = selected_parent;
+	/*
+	 * Child hop count will be parent_hop + 1 once the response
+	 * confirms membership; stash parent hop for now.
+	 */
+	hop_count = (parent_hop_count == HOP_COUNT_UNKNOWN) ?
+		    HOP_COUNT_UNKNOWN :
+		    (uint8_t)(parent_hop_count + 1U);
+
+	set_node_state(NODE_WAITING_FOR_JOIN_RESPONSE);
+}
+
+/*
+ * WAITING_FOR_JOIN_RESPONSE → REGISTERED after JOIN_RESPONSE
+ * + local short-address update. JOIN_ACK is sent by the caller.
+ */
+static void __maybe_unused node_enter_registered(
+	uint16_t assigned_address,
+	uint16_t assigned_parent,
+	uint8_t assigned_hop_count)
+{
+	int ret;
+
+	ret = set_local_address(assigned_address);
+	if (ret) {
+		LOG_ERR(
+			"Registration aborted: short address update failed (%d)",
+			ret
+		);
+		node_revert_to_unregistered();
+		return;
+	}
+
+	parent_address = assigned_parent;
+	hop_count = assigned_hop_count;
+	set_node_state(NODE_REGISTERED);
+	log_node_state("Registered");
+}
+
+/*
+ * Apply boot role to the FSM after the radio is up.
+ * Root stays REGISTERED. Joining nodes move UNREGISTERED → PROBING.
+ */
+static void node_fsm_init(void)
+{
+	current_state = BOOT_NODE_STATE;
+	parent_address = BOOT_PARENT_ADDRESS;
+	hop_count = BOOT_HOP_COUNT;
+
+	log_node_state("FSM boot");
+
+#if NODE_ROLE == ROLE_JOINING
+	if (current_state == NODE_UNREGISTERED) {
+		node_enter_probing();
+	}
+#endif
 }
 
 
@@ -1904,6 +2131,15 @@ static void handle_probe(
 	uint8_t body_buffer[HEARTBEAT_BODY_SIZE];
 	int ret;
 
+	if (!node_can_reply_heartbeat()) {
+		LOG_INF(
+			"PROBE seq=%u ignored (state=%s; only REGISTERED replies)",
+			(unsigned int)packet->sequence,
+			node_state_name(current_state)
+		);
+		return;
+	}
+
 	LOG_INF(
 		"PROBE seq=%u from 0x%04X (sender K = %d s)",
 		(unsigned int)packet->sequence,
@@ -1964,7 +2200,18 @@ static void handle_heartbeat(
 {
 	struct heartbeat_body body;
 
-	/* ARG_UNUSED(frame); */
+	/*
+	 * Until parent selection + JOIN land, heartbeats only matter
+	 * while PROBING. Later, REGISTERED nodes may also track them.
+	 */
+	if (current_state != NODE_PROBING) {
+		LOG_INF(
+			"HEARTBEAT seq=%u ignored (state=%s; expected PROBING)",
+			(unsigned int)packet->sequence,
+			node_state_name(current_state)
+		);
+		return;
+	}
 
 	/* process_frame() guarantees frame->length >= OZ_PACKET_SIZE. */
 	if (!deserialize_heartbeat_body(
@@ -2173,6 +2420,14 @@ static void probe_timer_expired(void)
 	struct oz_packet probe;
 	int ret;
 
+	if (!node_can_send_probe()) {
+		LOG_INF(
+			"Probe timer ignored (state=%s)",
+			node_state_name(current_state)
+		);
+		return;
+	}
+
 	if (probe_outstanding) {
 		link_stats.probes_missed++;
 		probe_k_seconds += PROBE_N_INCREMENT_SECONDS;
@@ -2222,7 +2477,8 @@ static void run_probe_sender(void)
 	k_ticks_t remaining;
 	int ret;
 
-	LOG_INF("Probe sender started (joining / unassigned)");
+	LOG_INF("Probe sender started (joining)");
+	log_node_state("Joining loop");
 	LOG_INF(
 		"Local       = %u:%u (0x%04X)",
 		(unsigned int)ADDRESS_NETWORK(local_address),
@@ -2277,6 +2533,7 @@ static void run_probe_receiver(void)
 	int ret;
 
 	LOG_INF("Probe receiver started (root)");
+	log_node_state("Root loop");
 	LOG_INF(
 		"Local       = %u:%u (0x%04X)",
 		(unsigned int)ADDRESS_NETWORK(local_address),
@@ -2561,6 +2818,11 @@ int main(void)
 	);
 
 	LOG_INF(
+		"FSM State  : %s",
+		node_state_name(current_state)
+	);
+
+	LOG_INF(
 		"Channel    : %u",
 		IEEE802154_CHANNEL
 	);
@@ -2601,6 +2863,14 @@ int main(void)
 
 	LOG_INF(
 		"Reserved   : 1:0  | Unassigned 255:254 | Broadcast 255:255"
+	);
+
+	LOG_INF(
+		"Parent     : %u:%u | Hop = %u | DATA allowed = %s",
+		(unsigned int)ADDRESS_NETWORK(parent_address),
+		(unsigned int)ADDRESS_NODE(parent_address),
+		(unsigned int)hop_count,
+		node_can_send_data() ? "yes" : "no"
 	);
 
 	/* Sanity: boot address must match role; pool helpers ready for join. */
@@ -2687,6 +2957,12 @@ int main(void)
 	}
 
 
+	/* =====================================================
+	 * Node FSM: root stays REGISTERED; joining → PROBING
+	 * ===================================================== */
+
+	node_fsm_init();
+
 
 	/* =====================================================
 	 * Run configured role
@@ -2698,7 +2974,7 @@ int main(void)
 
 #elif NODE_ROLE == ROLE_ROOT
 
-	LOG_INF("Root will listen for probes");
+	LOG_INF("Root will listen for probes (REGISTERED)");
 
 	run_probe_receiver();
 

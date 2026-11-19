@@ -72,30 +72,31 @@ Represent network address as network ID + node ID; on the wire as 16-bit.
 
 ## 2. Node roles and finite-state machine
 
-Required states (names may change; behavior must match):
+Required states (names may change; behavior must match):  
+**Doc:** `documentation/SECTION2_NODE_FSM.md`
 
 ```text
 UNREGISTERED → PROBING → WAITING_FOR_JOIN_RESPONSE → REGISTERED
 ```
 
-- [ ] `enum node_state` with at least:
-  - [ ] `NODE_UNREGISTERED`
-  - [ ] `NODE_PROBING`
-  - [ ] `NODE_WAITING_FOR_JOIN_RESPONSE`
-  - [ ] `NODE_REGISTERED`
-- [ ] **UNREGISTERED:** no assigned address; cannot send normal DATA
-- [ ] **PROBING:** periodically broadcast PROBE; listen for HEARTBEAT
-- [ ] **WAITING_FOR_JOIN_RESPONSE:** parent selected; waiting for assigned address
-- [ ] **REGISTERED:** has address, parent, route toward root; send periodic sensor DATA
-- [ ] Root starts already **REGISTERED** at **1:254** (hop count 0, parent = self / none as documented)
-- [ ] Non-root nodes start **UNREGISTERED** / enter **PROBING**
-- [ ] Revert to UNREGISTERED (or re-probe) if joining fails
-- [ ] Single firmware path that can be root **or** joining node (not fixed sender-only / receiver-only roles)
+- [x] `enum node_state` with at least:
+  - [x] `NODE_UNREGISTERED`
+  - [x] `NODE_PROBING`
+  - [x] `NODE_WAITING_FOR_JOIN_RESPONSE`
+  - [x] `NODE_REGISTERED`
+- [x] **UNREGISTERED:** no assigned address; cannot send normal DATA (`node_can_send_data()`)
+- [x] **PROBING:** periodically broadcast PROBE; listen for HEARTBEAT (gated + joining `node_fsm_init`)
+- [x] **WAITING_FOR_JOIN_RESPONSE:** helper `node_enter_waiting_for_join_response()` ready; join TX not wired yet
+- [x] **REGISTERED:** root boots here with parent/hop; DATA send loop still future
+- [x] Root starts already **REGISTERED** at **1:254** (hop 0, parent = self / `ROOT_ADDRESS`)
+- [x] Non-root nodes start **UNREGISTERED** / enter **PROBING** (`node_fsm_init`)
+- [x] Revert to UNREGISTERED helper (`node_revert_to_unregistered`); call sites on join failure still future
+- [x] Single firmware path that can be root **or** joining node (`ROLE_ROOT` / `ROLE_JOINING`)
 
 ### Current state vs FSM
 
-- [x] Compile-time `ROLE_ROOT` / `ROLE_JOINING` with correct boot addresses (FSM states still missing)
-- [ ] Full join / registration state machine
+- [x] Compile-time `ROLE_ROOT` / `ROLE_JOINING` with correct boot addresses + FSM
+- [~] Full join / registration state machine (states + transitions exist; JOIN messages not driving them yet)
 
 ---
 
@@ -388,7 +389,7 @@ Use this as the working sequence:
 | Version / signature filtering | **Done** |
 | PROBE / HEARTBEAT (root listens; joining broadcasts) | **Partial — join/parent rewrite still needed** |
 | Addressing (`1:254`, unassigned, broadcast, pool helpers) | **Done** (see `SECTION1_ADDRESSING.md`) |
-| Node FSM | **Not started** |
+| Node FSM | **Done** (see `SECTION2_NODE_FSM.md`; join-driven transitions pending) |
 | Parent selection | **Not started** |
 | Join request / response / ack | **Not started** (type slots reserved) |
 | Root address allocation table | **Not started** |
