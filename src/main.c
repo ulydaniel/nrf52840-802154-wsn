@@ -1,37 +1,36 @@
 /*
  * OzturkLab nRF52840
  *
- * IEEE 802.15.4 fixed-channel point-to-point experiment
+ * IEEE 802.15.4 data-collection tree (root network)
  *
  * One source file supports:
  *
- *      ROLE_SENDER
- *      ROLE_RECEIVER
+ *      ROLE_ROOT      — fixed address 1:254 (0x01FE)
+ *      ROLE_JOINING   — starts unassigned 255:254 (0xFFFE)
  *
- * Topology:
+ * Application addresses are network:node (see MAKE_ADDRESS).
+ * Only the root address is hard-coded. Joining nodes receive
+ * addresses 1:1 .. 1:253 dynamically through the join protocol
+ * (not yet implemented; see documentation/ASSIGNMENT_CHECKLIST.md).
  *
- *      Sender                         Receiver
- *      0x0001   ------------------->  0x0003
+ * Transitional probe / heartbeat (until join FSM lands):
  *
- * Probe / heartbeat exchange:
+ *      Joining (unassigned)  --PROBE broadcast-->  Root (1:254)
+ *      Joining (unassigned)  <-HEARTBEAT---------  Root (1:254)
  *
- *      0x0001   ------- PROBE ----->  0x0003
- *      0x0001   <---- HEARTBEAT ----  0x0003
- *
- *      Sender: every K seconds timer K expires and a PROBE
- *      is sent. If the previous PROBE received no HEARTBEAT
- *      by the time the timer expires again, K is incremented
- *      by N. A valid HEARTBEAT resets K to its initial value.
+ *      Joining node: every K seconds a PROBE is broadcast.
+ *      If no HEARTBEAT arrives before the next expiry, K grows
+ *      by N. A matching HEARTBEAT resets K.
  *
  *      HEARTBEAT carries: probe RSSI, GUID, battery level
  *      and a heartbeat sequence number (see Message bodies).
  *
  *      Both roles decode received packets and dispatch them
- *      through a 7-entry function-pointer table indexed by
- *      message type. Only PROBE and HEARTBEAT are
- *      implemented; the JOIN and NET ID entries are reserved.
+ *      through a function-pointer table indexed by message type.
+ *      Only PROBE and HEARTBEAT are implemented; JOIN / NET ID
+ *      / DATA entries are reserved for later milestones.
  *
- * Channel : 15
+ * Channel : 11
  * PAN ID  : 0x1234
  *
  * Zephyr / NCS:
@@ -76,18 +75,18 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  * USER CONFIGURATION
  * ========================================================= */
 
-#define ROLE_SENDER       1
-#define ROLE_RECEIVER     2
+#define ROLE_ROOT         1
+#define ROLE_JOINING      2
 
 
 /*
  * Change ONLY this line for each board:
  *
- * ROLE_SENDER
- * ROLE_RECEIVER
+ * ROLE_ROOT     — tree root, fixed address 1:254
+ * ROLE_JOINING  — starts unassigned; gets 1:1..1:253 via join
  */
 
-#define NODE_ROLE         ROLE_SENDER
+#define NODE_ROLE         ROLE_JOINING
 
 
 /* =========================================================
@@ -107,15 +106,45 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  *  8, 7, 6, 5, 4, 3, 2, 0,
  * -4, -8, -12, -16, -20, -40
  */
-#define IEEE802154_TX_POWER_DBM   0
+#define IEEE802154_TX_POWER_DBM   4
 
 
 /* =========================================================
- * Short addresses
+ * Application addressing model (assignment §4)
+ *
+ * A network address is network_id:node_id, packed as 16 bits:
+ *
+ *      bits 15..8 = network ID
+ *      bits  7..0 = node ID
+ *
+ * Only ROOT_ADDRESS is fixed at compile time. All other node
+ * addresses are assigned at run time by the root (join protocol).
  * ========================================================= */
 
-#define SENDER_ADDR              0x0001
-#define RECEIVER_ADDR            0x0003
+#define MAKE_ADDRESS(network, node) \
+	((uint16_t)((((uint16_t)(network) & 0xFFU) << 8) | \
+		    ((uint16_t)(node) & 0xFFU)))
+
+#define ADDRESS_NETWORK(addr) \
+	((uint8_t)(((uint16_t)(addr) >> 8) & 0xFFU))
+
+#define ADDRESS_NODE(addr) \
+	((uint8_t)((uint16_t)(addr) & 0xFFU))
+
+#define NETWORK_ID_ROOT          1
+
+#define ROOT_ADDRESS             MAKE_ADDRESS(NETWORK_ID_ROOT, 254)
+#define BROADCAST_ADDRESS        0xFFFF
+#define UNASSIGNED_ADDRESS       0xFFFE
+#define RESERVED_ADDRESS         MAKE_ADDRESS(NETWORK_ID_ROOT, 0)
+
+#define NODE_ID_FIRST_ASSIGNABLE 1
+#define NODE_ID_LAST_ASSIGNABLE  253
+
+#define ADDRESS_FIRST_ASSIGNABLE \
+	MAKE_ADDRESS(NETWORK_ID_ROOT, NODE_ID_FIRST_ASSIGNABLE)
+#define ADDRESS_LAST_ASSIGNABLE \
+	MAKE_ADDRESS(NETWORK_ID_ROOT, NODE_ID_LAST_ASSIGNABLE)
 
 
 /* =========================================================
@@ -256,20 +285,23 @@ struct heartbeat_body {
 
 
 /* =========================================================
- * Role-specific local address
+ * Role → boot address
+ *
+ * Root discovery is assumed complete: root starts at 1:254.
+ * Every other node boots unassigned until join succeeds.
  * ========================================================= */
 
-#if NODE_ROLE == ROLE_SENDER
+#if NODE_ROLE == ROLE_ROOT
 
-#define LOCAL_SHORT_ADDR     SENDER_ADDR
+#define BOOT_ADDRESS         ROOT_ADDRESS
 
-#elif NODE_ROLE == ROLE_RECEIVER
+#elif NODE_ROLE == ROLE_JOINING
 
-#define LOCAL_SHORT_ADDR     RECEIVER_ADDR
+#define BOOT_ADDRESS         UNASSIGNED_ADDRESS
 
 #else
 
-#error "Invalid NODE_ROLE"
+#error "Invalid NODE_ROLE: use ROLE_ROOT or ROLE_JOINING"
 
 #endif
 
@@ -279,6 +311,14 @@ struct heartbeat_body {
  * ========================================================= */
 
 static struct net_if *iface;
+
+/*
+ * Application / MAC short address for this node.
+ * Root: fixed ROOT_ADDRESS for the life of the node.
+ * Joining: starts UNASSIGNED_ADDRESS; set_local_address()
+ * will install the join-assigned value and push it to L2.
+ */
+static uint16_t local_address = BOOT_ADDRESS;
 
 static int packet_socket = -1;
 
@@ -315,15 +355,15 @@ static uint16_t tx_sequence = 1;
 
 
 /*
- * Probe state. Only the sender originates probes. It is
- * owned by the main thread, which also runs the message
- * handlers, so no locking is needed.
+ * Probe state. The joining node originates probes until the
+ * join FSM takes over. Owned by the main thread, which also
+ * runs the message handlers, so no locking is needed.
  */
 static unsigned int probe_k_seconds = PROBE_K_INITIAL_SECONDS;
 static uint16_t probe_outstanding_sequence;
 static bool probe_outstanding;
 
-#if NODE_ROLE == ROLE_SENDER
+#if NODE_ROLE == ROLE_JOINING
 K_TIMER_DEFINE(probe_timer, NULL, NULL);
 #endif
 
@@ -342,19 +382,185 @@ static bool battery_adc_ready;
 static uint16_t heartbeat_tx_sequence = 1;
 
 
+/*
+ * Link statistics, owned by the main thread like the probe
+ * state. Loss is detected two ways:
+ *   - sender: a probe whose timer K expired unanswered
+ *     (round-trip loss, either direction)
+ *   - sequence gaps: the receiver watches PROBE sequences and
+ *     the sender watches heartbeat sequences, so each side
+ *     sees the loss on its own incoming direction.
+ */
+struct link_stats {
+	uint32_t probes_sent;
+	uint32_t probes_tx_failed;
+	uint32_t probes_missed;
+	uint32_t probes_received;
+	uint32_t probes_lost;
+	uint32_t heartbeats_sent;
+	uint32_t heartbeats_tx_failed;
+	uint32_t heartbeats_accepted;
+	uint32_t heartbeats_received;
+	uint32_t heartbeats_lost;
+	uint32_t heartbeats_stale;
+};
+
+static struct link_stats link_stats;
+
+static uint16_t last_probe_rx_sequence;
+static bool probe_rx_sequence_valid;
+
+static uint16_t last_heartbeat_rx_sequence;
+static bool heartbeat_rx_sequence_valid;
+
+
+/* =========================================================
+ * Addressing helpers
+ * ========================================================= */
+
+static bool address_is_broadcast(uint16_t addr)
+{
+	return addr == BROADCAST_ADDRESS;
+}
+
+static bool address_is_unassigned(uint16_t addr)
+{
+	return addr == UNASSIGNED_ADDRESS;
+}
+
+static bool address_is_root(uint16_t addr)
+{
+	return addr == ROOT_ADDRESS;
+}
+
+static bool address_is_reserved(uint16_t addr)
+{
+	return (addr == RESERVED_ADDRESS) ||
+	       address_is_broadcast(addr) ||
+	       address_is_unassigned(addr) ||
+	       address_is_root(addr);
+}
+
+/*
+ * True for addresses the root may hand out: 1:1 .. 1:253.
+ */
+static bool address_is_assignable(uint16_t addr)
+{
+	uint8_t network = ADDRESS_NETWORK(addr);
+	uint8_t node = ADDRESS_NODE(addr);
+
+	if (network != NETWORK_ID_ROOT) {
+		return false;
+	}
+
+	if ((node < NODE_ID_FIRST_ASSIGNABLE) ||
+	    (node > NODE_ID_LAST_ASSIGNABLE)) {
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * True if this node should accept an application-layer frame.
+ * Unicast to our address, or broadcast discovery traffic.
+ */
+static bool address_is_for_me(uint16_t destination)
+{
+	return (destination == local_address) ||
+	       address_is_broadcast(destination);
+}
+
+/*
+ * Push the current local_address into the IEEE 802.15.4 L2
+ * short-address register. Used at boot and again when join
+ * assigns a new address (platform requirement).
+ *
+ * Note: after PAN ID + short address are both set, Zephyr may
+ * treat the node as associated and reject further parameter
+ * changes with -EBUSY. Callers that need a later change must
+ * be prepared to bring the interface down or reconfigure.
+ */
+static int ieee802154_apply_short_address(uint16_t addr)
+{
+	uint16_t value = addr;
+	int ret;
+
+	if (iface == NULL) {
+		return -ENODEV;
+	}
+
+	ret = net_mgmt(
+		NET_REQUEST_IEEE802154_SET_SHORT_ADDR,
+		iface,
+		&value,
+		sizeof(value)
+	);
+
+	if (ret) {
+		LOG_ERR(
+			"SET_SHORT_ADDR (0x%04X) failed: %d",
+			(unsigned int)addr,
+			ret
+		);
+		return ret;
+	}
+
+	LOG_INF(
+		"Short Addr  = 0x%04X (%u:%u)",
+		(unsigned int)addr,
+		(unsigned int)ADDRESS_NETWORK(addr),
+		(unsigned int)ADDRESS_NODE(addr)
+	);
+
+	return 0;
+}
+
+/*
+ * Install a new application address and mirror it to the radio.
+ * Returns 0 on success. On L2 failure, local_address is left
+ * unchanged.
+ *
+ * Called by the join path once a JOIN_RESPONSE assigns an
+ * address (Milestone 5). Marked maybe-unused until that lands.
+ */
+static int __maybe_unused set_local_address(uint16_t addr)
+{
+	uint16_t previous = local_address;
+	int ret;
+
+	local_address = addr;
+
+	ret = ieee802154_apply_short_address(addr);
+	if (ret) {
+		local_address = previous;
+		return ret;
+	}
+
+	LOG_INF(
+		"Local address set to %u:%u (0x%04X)",
+		(unsigned int)ADDRESS_NETWORK(addr),
+		(unsigned int)ADDRESS_NODE(addr),
+		(unsigned int)addr
+	);
+
+	return 0;
+}
+
+
 /* =========================================================
  * Role name
  * ========================================================= */
 
 static const char *role_name(void)
 {
-#if NODE_ROLE == ROLE_SENDER
+#if NODE_ROLE == ROLE_ROOT
 
-	return "SENDER";
+	return "ROOT";
 
-#elif NODE_ROLE == ROLE_RECEIVER
+#elif NODE_ROLE == ROLE_JOINING
 
-	return "RECEIVER";
+	return "JOINING";
 
 #else
 
@@ -438,12 +644,16 @@ static void print_packet(
 	);
 
 	LOG_INF(
-		"Source        = 0x%04X",
+		"Source        = %u:%u (0x%04X)",
+		(unsigned int)ADDRESS_NETWORK(source),
+		(unsigned int)ADDRESS_NODE(source),
 		source
 	);
 
 	LOG_INF(
-		"Destination   = 0x%04X",
+		"Destination   = %u:%u (0x%04X)",
+		(unsigned int)ADDRESS_NETWORK(destination),
+		(unsigned int)ADDRESS_NODE(destination),
 		destination
 	);
 
@@ -832,22 +1042,11 @@ static int configure_ieee802154(void)
 
     LOG_INF("PAN ID      = 0x%04X", IEEE802154_PAN_ID);
 
-    /* Short address */
-    value = LOCAL_SHORT_ADDR;
-
-    ret = net_mgmt(
-        NET_REQUEST_IEEE802154_SET_SHORT_ADDR,
-        iface,
-        &value,
-        sizeof(value)
-    );
-
+    /* Short address: root = 1:254, joining = unassigned. */
+    ret = ieee802154_apply_short_address(local_address);
     if (ret) {
-        LOG_ERR("SET_SHORT_ADDR failed: %d", ret);
         return ret;
     }
-
-    LOG_INF("Short Addr  = 0x%04X", LOCAL_SHORT_ADDR);
 
     /*
      * Original position of the transmit-power step, moved above
@@ -1513,7 +1712,7 @@ static void build_packet(
 	packet->signature[1] = 'Z';
 	packet->version = PROTOCOL_VERSION;
 	packet->message_type = message_type;
-	packet->source_id = LOCAL_SHORT_ADDR;
+	packet->source_id = local_address;
 	packet->destination_id = destination_id;
 	packet->value = value;
 	packet->sequence = sequence;
@@ -1577,6 +1776,120 @@ static void print_heartbeat_body(
 
 
 /*
+ * Count the frames missing between the last sequence seen and
+ * this one. A sequence that does not move forward (signed
+ * 16-bit difference <= 0) means the peer rebooted or the frame
+ * is a duplicate, so tracking restarts without counting loss.
+ * The signed difference also handles uint16_t wraparound.
+ */
+static uint32_t track_sequence_gap(
+	uint16_t sequence,
+	uint16_t *last_sequence,
+	bool *valid)
+{
+	int16_t delta;
+	uint32_t lost = 0;
+
+	if (*valid) {
+		delta = (int16_t)(sequence - *last_sequence);
+		if (delta > 1) {
+			lost = (uint32_t)(delta - 1);
+		}
+	}
+
+	*last_sequence = sequence;
+	*valid = true;
+
+	return lost;
+}
+
+
+/*
+ * Log "lost / total (x.y %)" with integer math, so it does
+ * not depend on floating point printf support.
+ */
+static void log_loss_line(const char *label, uint32_t lost, uint32_t total)
+{
+	uint32_t permille = 0;
+
+	if (total > 0) {
+		permille = (uint32_t)(((uint64_t)lost * 1000U) / total);
+	}
+
+	LOG_INF(
+		"%s = %u / %u (%u.%u %%)",
+		label,
+		(unsigned int)lost,
+		(unsigned int)total,
+		(unsigned int)(permille / 10U),
+		(unsigned int)(permille % 10U)
+	);
+}
+
+
+static void print_link_stats(void)
+{
+	LOG_INF("--------------------------------");
+
+#if NODE_ROLE == ROLE_JOINING
+	LOG_INF("LINK STATS (joining / probe)");
+
+	LOG_INF(
+		"Probes sent   = %u (TX failed %u)",
+		(unsigned int)link_stats.probes_sent,
+		(unsigned int)link_stats.probes_tx_failed
+	);
+
+	LOG_INF(
+		"HB accepted   = %u",
+		(unsigned int)link_stats.heartbeats_accepted
+	);
+
+	/* Round trip: resolved probes = answered + timed out. */
+	log_loss_line(
+		"Probe missed ",
+		link_stats.probes_missed,
+		link_stats.heartbeats_accepted + link_stats.probes_missed
+	);
+
+	/* Return path: heartbeat sequence gaps. */
+	log_loss_line(
+		"HB lost      ",
+		link_stats.heartbeats_lost,
+		link_stats.heartbeats_received + link_stats.heartbeats_lost
+	);
+
+	LOG_INF(
+		"HB stale      = %u",
+		(unsigned int)link_stats.heartbeats_stale
+	);
+#elif NODE_ROLE == ROLE_ROOT
+	LOG_INF("LINK STATS (root / heartbeat)");
+
+	LOG_INF(
+		"Probes RX     = %u",
+		(unsigned int)link_stats.probes_received
+	);
+
+	/* Forward path: PROBE sequence gaps. */
+	log_loss_line(
+		"Probes lost  ",
+		link_stats.probes_lost,
+		link_stats.probes_received + link_stats.probes_lost
+	);
+
+	LOG_INF(
+		"HB sent       = %u (TX failed %u)",
+		(unsigned int)link_stats.heartbeats_sent,
+		(unsigned int)link_stats.heartbeats_tx_failed
+	);
+#endif
+
+	LOG_INF("--------------------------------");
+}
+
+
+/*
  * PROBE: reply with a HEARTBEAT to the probing node. The
  * heartbeat header echoes the probe sequence and carries the
  * RSSI at which the probe was received; the heartbeat body
@@ -1596,6 +1909,13 @@ static void handle_probe(
 		(unsigned int)packet->sequence,
 		(unsigned int)packet->source_id,
 		(int)packet->value
+	);
+
+	link_stats.probes_received++;
+	link_stats.probes_lost += track_sequence_gap(
+		packet->sequence,
+		&last_probe_rx_sequence,
+		&probe_rx_sequence_valid
 	);
 
 	build_packet(
@@ -1623,9 +1943,13 @@ static void handle_probe(
 		sizeof(body_buffer),
 		packet->source_id
 	);
+	link_stats.heartbeats_sent++;
 	if (ret) {
+		link_stats.heartbeats_tx_failed++;
 		LOG_ERR("HEARTBEAT transmission failed: %d", ret);
 	}
+
+	print_link_stats();
 }
 
 
@@ -1657,8 +1981,17 @@ static void handle_heartbeat(
 		return;
 	}
 
+	/* Any valid heartbeat, stale or not, advances the gap tracking. */
+	link_stats.heartbeats_received++;
+	link_stats.heartbeats_lost += track_sequence_gap(
+		body.heartbeat_sequence,
+		&last_heartbeat_rx_sequence,
+		&heartbeat_rx_sequence_valid
+	);
+
 	if ((!probe_outstanding) ||
 	    (packet->sequence != probe_outstanding_sequence)) {
+		link_stats.heartbeats_stale++;
 		LOG_WRN(
 			"Stale/unsolicited HEARTBEAT seq=%u from 0x%04X ignored",
 			(unsigned int)packet->sequence,
@@ -1696,6 +2029,9 @@ static void handle_heartbeat(
 	print_heartbeat_body("HEARTBEAT RX BODY", &body, packet->value);
 
 	LOG_INF("K reset to %u s", probe_k_seconds);
+
+	link_stats.heartbeats_accepted++;
+	print_link_stats();
 }
 
 
@@ -1782,11 +2118,15 @@ static void process_frame(const struct received_frame *frame)
 		return;
 	}
 
-	if (packet.destination_id != LOCAL_SHORT_ADDR) {
+	if (!address_is_for_me(packet.destination_id)) {
 		LOG_INF(
-			"Packet ignored: destination=0x%04X, expected=0x%04X",
+			"Packet ignored: destination=0x%04X (%u:%u), local=0x%04X (%u:%u)",
 			(unsigned int)packet.destination_id,
-			LOCAL_SHORT_ADDR
+			(unsigned int)ADDRESS_NETWORK(packet.destination_id),
+			(unsigned int)ADDRESS_NODE(packet.destination_id),
+			(unsigned int)local_address,
+			(unsigned int)ADDRESS_NETWORK(local_address),
+			(unsigned int)ADDRESS_NODE(local_address)
 		);
 		return;
 	}
@@ -1814,10 +2154,14 @@ static void process_frame(const struct received_frame *frame)
 
 
 /* =========================================================
- * Sender role (probe timer)
+ * Joining node (transitional probe timer)
+ *
+ * Until the join FSM is implemented, the joining board still
+ * drives PROBE / HEARTBEAT discovery. Probes use the unassigned
+ * source address and a broadcast destination (assignment §7.1).
  * ========================================================= */
 
-#if NODE_ROLE == ROLE_SENDER
+#if NODE_ROLE == ROLE_JOINING
 
 /*
  * Runs each time timer K expires. A probe still outstanding
@@ -1830,6 +2174,7 @@ static void probe_timer_expired(void)
 	int ret;
 
 	if (probe_outstanding) {
+		link_stats.probes_missed++;
 		probe_k_seconds += PROBE_N_INCREMENT_SECONDS;
 
 		if (probe_k_seconds > PROBE_K_MAX_SECONDS) {
@@ -1841,20 +2186,24 @@ static void probe_timer_expired(void)
 			(unsigned int)probe_outstanding_sequence,
 			probe_k_seconds
 		);
+
+		print_link_stats();
 	}
 
 	build_packet(
 		&probe,
 		MSG_TYPE_PROBE,
-		RECEIVER_ADDR,
+		BROADCAST_ADDRESS,
 		(int16_t)probe_k_seconds,
 		tx_sequence++
 	);
 
 	print_packet("PROBE TX", &probe);
 
-	ret = send_oz_packet(&probe, RECEIVER_ADDR);
+	ret = send_oz_packet(&probe, BROADCAST_ADDRESS);
+	link_stats.probes_sent++;
 	if (ret) {
+		link_stats.probes_tx_failed++;
 		LOG_ERR("PROBE transmission failed: %d", ret);
 	}
 
@@ -1873,8 +2222,19 @@ static void run_probe_sender(void)
 	k_ticks_t remaining;
 	int ret;
 
-	LOG_INF("Probe sender started");
-	LOG_INF("Destination = 0x%04X", RECEIVER_ADDR);
+	LOG_INF("Probe sender started (joining / unassigned)");
+	LOG_INF(
+		"Local       = %u:%u (0x%04X)",
+		(unsigned int)ADDRESS_NETWORK(local_address),
+		(unsigned int)ADDRESS_NODE(local_address),
+		(unsigned int)local_address
+	);
+	LOG_INF(
+		"Destination = %u:%u (0x%04X broadcast)",
+		(unsigned int)ADDRESS_NETWORK(BROADCAST_ADDRESS),
+		(unsigned int)ADDRESS_NODE(BROADCAST_ADDRESS),
+		(unsigned int)BROADCAST_ADDRESS
+	);
 	LOG_INF(
 		"K = %u s, N = %u s, K max = %u s",
 		PROBE_K_INITIAL_SECONDS,
@@ -1906,17 +2266,23 @@ static void run_probe_sender(void)
 
 
 /* =========================================================
- * Receiver role (probe listener)
+ * Root node (transitional probe listener / heartbeat reply)
  * ========================================================= */
 
-#if NODE_ROLE == ROLE_RECEIVER
+#if NODE_ROLE == ROLE_ROOT
 
 static void run_probe_receiver(void)
 {
 	struct received_frame frame;
 	int ret;
 
-	LOG_INF("Probe receiver started");
+	LOG_INF("Probe receiver started (root)");
+	LOG_INF(
+		"Local       = %u:%u (0x%04X)",
+		(unsigned int)ADDRESS_NETWORK(local_address),
+		(unsigned int)ADDRESS_NODE(local_address),
+		(unsigned int)local_address
+	);
 	LOG_INF("Waiting for PROBE packets...");
 
 	while (1) {
@@ -2210,9 +2576,40 @@ int main(void)
 	);
 
 	LOG_INF(
-		"Short Addr : 0x%04X",
-		LOCAL_SHORT_ADDR
+		"App Addr   : %u:%u (0x%04X)%s",
+		(unsigned int)ADDRESS_NETWORK(local_address),
+		(unsigned int)ADDRESS_NODE(local_address),
+		(unsigned int)local_address,
+		address_is_root(local_address) ? " [ROOT]" :
+		address_is_unassigned(local_address) ? " [UNASSIGNED]" : ""
 	);
+
+	LOG_INF(
+		"Root Addr  : %u:%u (0x%04X)",
+		(unsigned int)ADDRESS_NETWORK(ROOT_ADDRESS),
+		(unsigned int)ADDRESS_NODE(ROOT_ADDRESS),
+		(unsigned int)ROOT_ADDRESS
+	);
+
+	LOG_INF(
+		"Assignable : %u:%u .. %u:%u",
+		(unsigned int)ADDRESS_NETWORK(ADDRESS_FIRST_ASSIGNABLE),
+		(unsigned int)ADDRESS_NODE(ADDRESS_FIRST_ASSIGNABLE),
+		(unsigned int)ADDRESS_NETWORK(ADDRESS_LAST_ASSIGNABLE),
+		(unsigned int)ADDRESS_NODE(ADDRESS_LAST_ASSIGNABLE)
+	);
+
+	LOG_INF(
+		"Reserved   : 1:0  | Unassigned 255:254 | Broadcast 255:255"
+	);
+
+	/* Sanity: boot address must match role; pool helpers ready for join. */
+	if (address_is_reserved(ADDRESS_FIRST_ASSIGNABLE) ||
+	    !address_is_assignable(ADDRESS_FIRST_ASSIGNABLE) ||
+	    !address_is_assignable(ADDRESS_LAST_ASSIGNABLE)) {
+		LOG_ERR("Address model self-check failed");
+		return 0;
+	}
 
 	LOG_INF(
 		"OZ Payload : %u bytes",
@@ -2264,13 +2661,13 @@ int main(void)
 	 * ===================================================== */
 
 	/*
-#if NODE_ROLE == ROLE_SENDER
+#if NODE_ROLE == ROLE_JOINING
 	ret = create_packet_socket();
 	if (ret) {
 		LOG_ERR("Packet socket setup failed: %d", ret);
 		return 0;
 	}
-#elif NODE_ROLE == ROLE_RECEIVER
+#elif NODE_ROLE == ROLE_ROOT
 	ret = create_receive_context();
 	if (ret) {
 		LOG_ERR("Receiver context setup failed: %d", ret);
@@ -2295,22 +2692,15 @@ int main(void)
 	 * Run configured role
 	 * ===================================================== */
 
-#if NODE_ROLE == ROLE_SENDER
-
-	// run_sender();
+#if NODE_ROLE == ROLE_JOINING
 
 	run_probe_sender();
 
-#elif NODE_ROLE == ROLE_RECEIVER
+#elif NODE_ROLE == ROLE_ROOT
 
-LOG_INF(
-	"Receiver will be started"
-	);
-
-	// run_receiver();
+	LOG_INF("Root will listen for probes");
 
 	run_probe_receiver();
-
 
 #endif
 
