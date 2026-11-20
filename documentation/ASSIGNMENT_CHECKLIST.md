@@ -47,7 +47,7 @@ Infrastructure from the supplied / evolved sender-receiver program. Keep unless 
 - [x] Battery ADC / percent reporting
 - [x] Probe K / N backoff (current sender poll model)
 - [x] Link / sequence-gap stats (`main.c`)
-- [~] Multi-threaded variant in `src/code.c` (builds if CMake pointed at it; not default)
+- [x] RX/protocol + TX threads in `src/main.c` (see `documentation/RX_TX_THREADS.md`); older experiment remains in `src/code.c`
 
 ---
 

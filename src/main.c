@@ -46,6 +46,14 @@
  *      parents forward toward the root; the root reports missing
  *      sequences per child source.
  *
+ * Threading (Zephyr):
+ *      Radio callback  → receive_queue (never blocks)
+ *      RX/protocol thread → process_frame / FSM / timers;
+ *                          submit TX via tx_queue
+ *      TX thread       → sole caller of net_context_sendto()
+ *
+ *      See documentation/RX_TX_THREADS.md.
+ *
  * Channel : 11
  * PAN ID  : 0x1234
  *
@@ -172,8 +180,21 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 #define TX_PERIOD_MS             1000
 
-#define RX_QUEUE_DEPTH           4
+#define RX_QUEUE_DEPTH           8
+#define TX_QUEUE_DEPTH           8
 #define RX_WAIT_TIMEOUT_SECONDS  5
+
+/*
+ * Application RX / TX threads (Zephyr k_thread).
+ * RX is higher priority so the receive queue drains first.
+ * TX uses a bounded send timeout so a stuck radio cannot
+ * stall the TX thread forever.
+ */
+#define APP_RX_STACK_SIZE        2048
+#define APP_TX_STACK_SIZE        2048
+#define APP_RX_PRIORITY          5
+#define APP_TX_PRIORITY          6
+#define TX_SEND_TIMEOUT_MS       100
 
 /*
  * Application message types (assignment §3). Values are
@@ -428,7 +449,8 @@ static int packet_socket = -1;
  * Both roles now receive (the sender listens for heartbeats),
  * so the receiver-only guard is disabled.
  *
- * receive_context is also used for TX (see send_oz_packet).
+ * receive_context is also used for TX (TX thread only;
+ * see radio_send_buffer / send_oz_packet).
  * Every bound AF_PACKET endpoint gets its own clone of each
  * received frame, so a second, never-read endpoint such as
  * packet_socket would slowly exhaust the network RX buffers.
@@ -443,10 +465,35 @@ struct received_frame {
 	int16_t rssi_dbm;
 };
 
+/*
+ * Serialized TX job for the TX thread. The submitting thread
+ * (RX/protocol) copies the full payload here so the TX thread
+ * never reads shared oz_packet / FSM state.
+ */
+struct tx_request {
+	uint16_t mac_destination;
+	uint16_t length;
+	uint8_t data[OZ_PACKET_SIZE + OZ_MAX_BODY_SIZE];
+};
+
 K_MSGQ_DEFINE(receive_queue,
 	      sizeof(struct received_frame),
 	      RX_QUEUE_DEPTH,
 	      4);
+
+K_MSGQ_DEFINE(tx_queue,
+	      sizeof(struct tx_request),
+	      TX_QUEUE_DEPTH,
+	      4);
+
+/*
+ * Static + app_-prefixed: Zephyr's net_tc.c already exports
+ * global rx_stack / tx_stack symbols.
+ */
+static K_THREAD_STACK_DEFINE(app_rx_stack, APP_RX_STACK_SIZE);
+static K_THREAD_STACK_DEFINE(app_tx_stack, APP_TX_STACK_SIZE);
+static struct k_thread app_rx_thread;
+static struct k_thread app_tx_thread;
 // #endif
 
 
@@ -458,8 +505,9 @@ static uint16_t tx_sequence = 1;
 
 /*
  * Probe state. The joining node originates probes until parent
- * selection starts JOIN_REQUEST. Owned by the main thread, which
- * also runs the message handlers, so no locking is needed.
+ * selection starts JOIN_REQUEST. Owned by the RX/protocol
+ * thread, which also runs the message handlers, so no locking
+ * is needed between protocol and handlers.
  */
 static unsigned int probe_k_seconds = PROBE_K_INITIAL_SECONDS;
 static uint16_t probe_outstanding_sequence;
@@ -561,7 +609,7 @@ static uint16_t heartbeat_tx_sequence = 1;
 
 
 /*
- * Link statistics, owned by the main thread like the probe
+ * Link statistics, owned by the RX/protocol thread like the probe
  * state. Loss is detected two ways:
  *   - sender: a probe whose timer K expired unanswered
  *     (round-trip loss, either direction)
@@ -1684,189 +1732,20 @@ static __maybe_unused int create_packet_socket(void)
 
 
 /* =========================================================
- * Send application packet
+ * Radio TX (TX thread only)
  *
- * mac_destination is the IEEE 802.15.4 MAC destination.
+ * Sole caller of net_context_sendto(). Bounded timeout keeps
+ * the TX thread responsive if buffers are exhausted.
  * ========================================================= */
 
-static int send_oz_packet(
-	const struct oz_packet *packet,
+static int radio_send_buffer(
+	const uint8_t *buffer,
+	size_t length,
 	uint16_t mac_destination)
 {
 	struct sockaddr_ll destination;
-
-	uint8_t buffer[OZ_PACKET_SIZE];
-
-	ssize_t sent;
-
-
-	/* -----------------------------------------------------
-	 * Serialize application payload
-	 * ----------------------------------------------------- */
-
-	serialize_packet(
-		packet,
-		buffer
-	);
-
-
-	/* -----------------------------------------------------
-	 * Build destination link-layer address
-	 *
-	 * Zephyr packet/L2 addresses are represented in
-	 * network/big-endian order at this interface.
-	 * ----------------------------------------------------- */
-
-	memset(
-		&destination,
-		0,
-		sizeof(destination)
-	);
-
-
-	destination.sll_family =
-		AF_PACKET;
-
-
-	destination.sll_protocol =
-		htons(ETH_P_IEEE802154);
-
-
-	destination.sll_ifindex =
-		net_if_get_by_iface(iface);
-
-
-	destination.sll_halen =
-		IEEE802154_SHORT_ADDR_LENGTH;
-
-
-	sys_put_be16(
-		mac_destination,
-		destination.sll_addr
-	);
-
-
-	/* -----------------------------------------------------
-	 * Send application payload.
-	 *
-	 * IEEE 802.15.4 L2 creates the MAC frame.
-	 * ----------------------------------------------------- */
-
-	printk("TX RAW: ");
-
-	for (int i = 0; i < OZ_PACKET_SIZE; i++) {
-		printk("%02X ", buffer[i]);
-	}
-	printk("\n");
-
-	/*
-	sent =
-		zsock_sendto(
-			packet_socket,
-			buffer,
-			sizeof(buffer),
-			0,
-			(const struct sockaddr *)&destination,
-			sizeof(destination)
-		);
-	*/
-
-	/*
-	 * Same call a packet socket's sendto() makes internally.
-	 * Returns bytes sent or a negative errno value.
-	 */
-	sent =
-		net_context_sendto(
-			receive_context,
-			buffer,
-			sizeof(buffer),
-			(const struct sockaddr *)&destination,
-			sizeof(destination),
-			NULL,
-			K_FOREVER,
-			NULL
-		);
-
-
-	LOG_INF(
-		"sendto() returned %d",(int)sent
-	);
-
-
-	/*
-	if (sent < 0) {
-
-		LOG_ERR(
-			"sendto() failed, errno=%d",
-			errno
-		);
-
-		return -errno;
-	}
-	*/
-
-	if (sent < 0) {
-
-		LOG_ERR(
-			"net_context_sendto() failed: %d",
-			(int)sent
-		);
-
-		return (int)sent;
-	}
-
-
-	if (sent != OZ_PACKET_SIZE) {
-
-		LOG_ERR(
-			"Short TX: %d bytes",
-			(int)sent
-		);
-
-		return -EIO;
-	}
-
-
-	LOG_INF(
-		"MAC TX -> 0x%04X, payload=%d bytes",
-		mac_destination,
-		(int)sent
-	);
-
-
-	return 0;
-}
-
-
-/* =========================================================
- * Send application packet + message body
- *
- * Same as send_oz_packet(), but appends a message-specific
- * body (e.g. the HEARTBEAT body) after the OZ header.
- * ========================================================= */
-
-static int send_oz_packet_with_body(
-	const struct oz_packet *packet,
-	const uint8_t *body,
-	size_t body_length,
-	uint16_t mac_destination)
-{
-	struct sockaddr_ll destination;
-	uint8_t buffer[OZ_PACKET_SIZE + OZ_MAX_BODY_SIZE];
-	size_t length;
 	int sent;
 
-	if (body_length > OZ_MAX_BODY_SIZE) {
-		LOG_ERR("Body too large: %d bytes", (int)body_length);
-		return -EMSGSIZE;
-	}
-
-	length = OZ_PACKET_SIZE + body_length;
-
-	serialize_packet(packet, buffer);
-	memcpy(&buffer[OZ_PACKET_SIZE], body, body_length);
-
-	/* Destination link-layer address, big-endian (see send_oz_packet). */
 	memset(&destination, 0, sizeof(destination));
 	destination.sll_family = AF_PACKET;
 	destination.sll_protocol = htons(ETH_P_IEEE802154);
@@ -1887,9 +1766,11 @@ static int send_oz_packet_with_body(
 		(const struct sockaddr *)&destination,
 		sizeof(destination),
 		NULL,
-		K_FOREVER,
+		K_MSEC(TX_SEND_TIMEOUT_MS),
 		NULL
 	);
+
+	LOG_INF("sendto() returned %d", sent);
 
 	if (sent < 0) {
 		LOG_ERR("net_context_sendto() failed: %d", sent);
@@ -1908,6 +1789,86 @@ static int send_oz_packet_with_body(
 	);
 
 	return 0;
+}
+
+
+/*
+ * Queue a serialized payload for the TX thread.
+ * Safe to call from the RX/protocol thread (and only that
+ * thread submits today). Returns 0 if queued, -ENOBUFS if
+ * the TX queue is full.
+ */
+static int tx_queue_submit(
+	const uint8_t *buffer,
+	size_t length,
+	uint16_t mac_destination)
+{
+	struct tx_request request;
+
+	if ((buffer == NULL) ||
+	    (length == 0) ||
+	    (length > sizeof(request.data))) {
+		return -EINVAL;
+	}
+
+	memset(&request, 0, sizeof(request));
+	request.mac_destination = mac_destination;
+	request.length = (uint16_t)length;
+	memcpy(request.data, buffer, length);
+
+	if (k_msgq_put(&tx_queue, &request, K_NO_WAIT) != 0) {
+		LOG_WRN("TX queue full; packet dropped");
+		return -ENOBUFS;
+	}
+
+	return 0;
+}
+
+
+/* =========================================================
+ * Submit application packet (RX/protocol thread)
+ *
+ * Serializes and enqueues; the TX thread performs the radio
+ * send. mac_destination is the IEEE 802.15.4 MAC destination.
+ * ========================================================= */
+
+static int send_oz_packet(
+	const struct oz_packet *packet,
+	uint16_t mac_destination)
+{
+	uint8_t buffer[OZ_PACKET_SIZE];
+
+	serialize_packet(packet, buffer);
+	return tx_queue_submit(buffer, sizeof(buffer), mac_destination);
+}
+
+
+/* =========================================================
+ * Submit application packet + message body
+ *
+ * Same as send_oz_packet(), but appends a message-specific
+ * body (e.g. the HEARTBEAT body) after the OZ header.
+ * ========================================================= */
+
+static int send_oz_packet_with_body(
+	const struct oz_packet *packet,
+	const uint8_t *body,
+	size_t body_length,
+	uint16_t mac_destination)
+{
+	uint8_t buffer[OZ_PACKET_SIZE + OZ_MAX_BODY_SIZE];
+	size_t length;
+
+	if (body_length > OZ_MAX_BODY_SIZE) {
+		LOG_ERR("Body too large: %d bytes", (int)body_length);
+		return -EMSGSIZE;
+	}
+
+	length = OZ_PACKET_SIZE + body_length;
+	serialize_packet(packet, buffer);
+	memcpy(&buffer[OZ_PACKET_SIZE], body, body_length);
+
+	return tx_queue_submit(buffer, length, mac_destination);
 }
 
 
@@ -2047,7 +2008,7 @@ printk("\n");
  * The callback receives Zephyr's original net_pkt, allowing
  * RSSI to be read from the metadata for that exact frame.
  * The frame is copied into a message queue so processing and
- * logging occur in the application thread.
+ * logging occur in the RX/protocol thread.
  * ========================================================= */
 
 static void packet_receive_callback(
@@ -2928,7 +2889,8 @@ static void root_collect_data(const struct oz_packet *packet)
  * Message handlers
  *
  * Every handler has the same signature so it can be stored
- * in message_handlers[]. Handlers run in the main thread.
+ * in message_handlers[]. Handlers run in the RX/protocol
+ * thread; any TX goes through send_oz_packet() → tx_queue.
  * ========================================================= */
 
 typedef void (*message_handler_t)(
@@ -4192,7 +4154,53 @@ static void run_receiver(void)
 
 
 /* =========================================================
- * Main
+ * Application threads
+ * ========================================================= */
+
+static void rx_thread_entry(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	LOG_INF("RX/protocol thread started");
+
+#if NODE_ROLE == ROLE_JOINING
+	run_probe_sender();
+#elif NODE_ROLE == ROLE_ROOT
+	LOG_INF("Root will answer probes and allocate join addresses");
+	run_probe_receiver();
+#endif
+}
+
+static void tx_thread_entry(void *p1, void *p2, void *p3)
+{
+	struct tx_request request;
+	int ret;
+
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	LOG_INF("TX thread started");
+
+	while (1) {
+		ret = k_msgq_get(&tx_queue, &request, K_FOREVER);
+		if (ret != 0) {
+			continue;
+		}
+
+		(void)radio_send_buffer(
+			request.data,
+			request.length,
+			request.mac_destination
+		);
+	}
+}
+
+
+/* =========================================================
+ * Main — init radio, then start RX / TX threads
  * ========================================================= */
 
 int main(void)
@@ -4363,21 +4371,43 @@ int main(void)
 
 
 	/* =====================================================
-	 * Run configured role
+	 * Start RX/protocol and TX threads, then idle.
+	 * Role loops never return; main must not call them.
 	 * ===================================================== */
 
-#if NODE_ROLE == ROLE_JOINING
+	k_thread_create(
+		&app_rx_thread,
+		app_rx_stack,
+		K_THREAD_STACK_SIZEOF(app_rx_stack),
+		rx_thread_entry,
+		NULL,
+		NULL,
+		NULL,
+		APP_RX_PRIORITY,
+		0,
+		K_NO_WAIT
+	);
+	k_thread_name_set(&app_rx_thread, "app_rx");
 
-	run_probe_sender();
+	k_thread_create(
+		&app_tx_thread,
+		app_tx_stack,
+		K_THREAD_STACK_SIZEOF(app_tx_stack),
+		tx_thread_entry,
+		NULL,
+		NULL,
+		NULL,
+		APP_TX_PRIORITY,
+		0,
+		K_NO_WAIT
+	);
+	k_thread_name_set(&app_tx_thread, "app_tx");
 
-#elif NODE_ROLE == ROLE_ROOT
-
-	LOG_INF("Root will answer probes and allocate join addresses");
-
-	run_probe_receiver();
-
-#endif
-
+	LOG_INF(
+		"Threads started (RX prio %d, TX prio %d)",
+		APP_RX_PRIORITY,
+		APP_TX_PRIORITY
+	);
 
 	return 0;
 }
