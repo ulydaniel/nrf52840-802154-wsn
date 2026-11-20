@@ -218,7 +218,7 @@ Addressing answers “what is my 16-bit ID?”. The FSM answers “what phase of
 ## 8. Still not done (later checklist sections)
 
 - Driving `WAITING_FOR_JOIN_RESPONSE` from parent selection  
-- JOIN_REQUEST / RESPONSE / ACK handlers calling `node_enter_*`  
+- JOIN_REQUEST / RESPONSE / ACKNOWLEDGE **TX** and handlers calling `node_enter_*` (decode handlers exist in §3)  
 - Periodic DATA only when `node_can_send_data()`  
 - Automatic revert on join timeout (helper exists; timer not wired)  
 - Multi-hop registered nodes answering probes (gate already allows any `REGISTERED` node)

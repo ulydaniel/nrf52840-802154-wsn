@@ -163,7 +163,7 @@ Probe TX uses:
 - App source = `local_address` (unassigned on joining boards)  
 - App + MAC destination = `BROADCAST_ADDRESS`
 
-Full parent selection / JOIN_* / dynamic allocation are **not** part of this section.
+Full parent selection / JOIN_* / dynamic allocation are **not** part of this section. Common header parent / assigned / hop fields are documented in `SECTION3_MESSAGE_TYPES.md`.
 
 ---
 

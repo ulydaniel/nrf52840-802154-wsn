@@ -34,8 +34,9 @@
  *
  *      Both roles decode received packets and dispatch them
  *      through a function-pointer table indexed by message type.
- *      Only PROBE and HEARTBEAT are implemented; JOIN / NET ID
- *      / DATA entries are reserved for later milestones.
+ *      Types 1–8 match the assignment; PROBE / HEARTBEAT drive
+ *      discovery today. JOIN / DATA / NETID handlers decode and
+ *      log; join allocation and DATA forwarding are later.
  *
  * Channel : 11
  * PAN ID  : 0x1234
@@ -158,7 +159,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  * Application protocol
  * ========================================================= */
 
-#define PROTOCOL_VERSION         1
+#define PROTOCOL_VERSION         2
 #define MESSAGE_TYPE_DATA        1
 
 #define TX_PERIOD_MS             1000
@@ -167,20 +168,31 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define RX_WAIT_TIMEOUT_SECONDS  5
 
 /*
- * Probe protocol message types. Values are contiguous so
- * (type - MSG_TYPE_FIRST) indexes message_handlers[].
+ * Application message types (assignment §3). Values are
+ * contiguous so (type - MSG_TYPE_FIRST) indexes
+ * message_handlers[].
+ *
+ *      1 PROBE
+ *      2 HEARTBEAT
+ *      3 JOIN_REQUEST
+ *      4 JOIN_RESPONSE
+ *      5 JOIN_ACKNOWLEDGE
+ *      6 DATA
+ *      7 NETIDREQ
+ *      8 NETIDRESP
  */
-#define MSG_TYPE_PROBE           1
-#define MSG_TYPE_HEARTBEAT       2
-#define MSG_TYPE_JOIN_REQUEST    3
-#define MSG_TYPE_JOIN_RESPONSE   4
-#define MSG_TYPE_JOIN_ACK        5
-#define MSG_TYPE_NETID_REQUEST   6
-#define MSG_TYPE_NETID_RESPONSE  7
+#define MSG_TYPE_PROBE              1
+#define MSG_TYPE_HEARTBEAT          2
+#define MSG_TYPE_JOIN_REQUEST       3
+#define MSG_TYPE_JOIN_RESPONSE      4
+#define MSG_TYPE_JOIN_ACKNOWLEDGE   5
+#define MSG_TYPE_DATA               6
+#define MSG_TYPE_NETID_REQUEST      7
+#define MSG_TYPE_NETID_RESPONSE     8
 
-#define MSG_TYPE_FIRST           MSG_TYPE_PROBE
-#define MSG_TYPE_LAST            MSG_TYPE_NETID_RESPONSE
-#define MSG_HANDLER_COUNT        (MSG_TYPE_LAST - MSG_TYPE_FIRST + 1)
+#define MSG_TYPE_FIRST              MSG_TYPE_PROBE
+#define MSG_TYPE_LAST               MSG_TYPE_NETID_RESPONSE
+#define MSG_HANDLER_COUNT           (MSG_TYPE_LAST - MSG_TYPE_FIRST + 1)
 
 /*
  * Sender probe timer:
@@ -212,29 +224,46 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define BATTERY_ADC_GAIN           ADC_GAIN_1_6
 
 /* =========================================================
- * Application payload
+ * Application payload (common OZ header)
  *
- * 12 bytes total
+ * 17 bytes total — PROTOCOL_VERSION 2
  *
  * Byte  0-1   Signature "OZ"
  * Byte  2     Version
  * Byte  3     Message type
- * Byte  4-5   Original source
- * Byte  6-7   Final destination
- * Byte  8-9   User/sensor value
- * Byte  10-11 Sequence
+ * Byte  4-5   Source address
+ * Byte  6-7   Destination address
+ * Byte  8-9   Parent address
+ * Byte  10-11 Assigned address
+ * Byte  12    Hop count (0xFF = unknown)
+ * Byte  13-14 Value / sensor / type-specific int16
+ * Byte  15-16 Sequence
  *
- * Probe protocol use of the same fields:
+ * Type-specific use of shared fields:
  *
- *      PROBE     value    = sender's current K (seconds)
- *      HEARTBEAT value    = RSSI of the probe at receiver
- *      HEARTBEAT sequence = echoes the PROBE sequence
+ *      PROBE           value    = sender's current K (seconds)
+ *                      parent   = UNASSIGNED until joined
+ *                      hop      = HOP_COUNT_UNKNOWN until joined
+ *      HEARTBEAT       value    = RSSI of the probe at receiver
+ *                      sequence = echoes the PROBE sequence
+ *                      parent   = responder's parent toward root
+ *                      hop      = responder's hop count to root
+ *      JOIN_REQUEST    parent   = selected parent
+ *                      hop      = proposed child hop (parent+1)
+ *      JOIN_RESPONSE   assigned = address granted by root
+ *                      parent   = parent the joiner should use
+ *                      hop      = hop count for the new child
+ *      JOIN_ACKNOWLEDGE assigned = address the joiner accepted
+ *                      parent   = parent the joiner installed
+ *      DATA            value    = sensor reading
+ *                      hop      = hops remaining / sender hop
  *
  * Multi-byte application fields are serialized explicitly
- * as little endian.
+ * as little endian. Message bodies (e.g. HEARTBEAT GUID /
+ * battery) still append after this header.
  * ========================================================= */
 
-#define OZ_PACKET_SIZE   12
+#define OZ_PACKET_SIZE   17
 
 
 struct oz_packet {
@@ -247,6 +276,10 @@ struct oz_packet {
 	uint16_t source_id;
 	uint16_t destination_id;
 
+	uint16_t parent_id;
+	uint16_t assigned_id;
+	uint8_t hop_count;
+
 	int16_t value;
 
 	uint16_t sequence;
@@ -256,11 +289,11 @@ struct oz_packet {
 /* =========================================================
  * Message bodies
  *
- * Some message types append a body after the 12-byte OZ
+ * Some message types append a body after the common OZ
  * header. The header is always parsed first; the handler
  * for the message type then parses its own body.
  *
- * HEARTBEAT body, 13 bytes (frame bytes 12-24):
+ * HEARTBEAT body, 13 bytes (frame bytes 17-29):
  *
  * Body  0-7   GUID (64-bit factory device ID, hwinfo order)
  * Body  8-9   Battery voltage, millivolts
@@ -271,6 +304,8 @@ struct oz_packet {
  *
  *      value    = RSSI of the probe at the receiver (dBm)
  *      sequence = echoes the PROBE sequence
+ *      parent   = responder parent address
+ *      hop      = responder hop count to root
  * ========================================================= */
 
 #define GUID_SIZE                8
@@ -730,7 +765,7 @@ static void __maybe_unused node_enter_waiting_for_join_response(
 
 /*
  * WAITING_FOR_JOIN_RESPONSE → REGISTERED after JOIN_RESPONSE
- * + local short-address update. JOIN_ACK is sent by the caller.
+ * + local short-address update. JOIN_ACKNOWLEDGE is sent by the caller.
  */
 static void __maybe_unused node_enter_registered(
 	uint16_t assigned_address,
@@ -812,8 +847,10 @@ static const char *message_type_name(uint8_t type)
 		return "JOIN_REQUEST";
 	case MSG_TYPE_JOIN_RESPONSE:
 		return "JOIN_RESPONSE";
-	case MSG_TYPE_JOIN_ACK:
-		return "JOIN_ACK";
+	case MSG_TYPE_JOIN_ACKNOWLEDGE:
+		return "JOIN_ACKNOWLEDGE";
+	case MSG_TYPE_DATA:
+		return "DATA";
 	case MSG_TYPE_NETID_REQUEST:
 		return "NETID_REQUEST";
 	case MSG_TYPE_NETID_RESPONSE:
@@ -885,6 +922,29 @@ static void print_packet(
 	);
 
 	LOG_INF(
+		"Parent        = %u:%u (0x%04X)",
+		(unsigned int)ADDRESS_NETWORK(packet->parent_id),
+		(unsigned int)ADDRESS_NODE(packet->parent_id),
+		(unsigned int)packet->parent_id
+	);
+
+	LOG_INF(
+		"Assigned      = %u:%u (0x%04X)",
+		(unsigned int)ADDRESS_NETWORK(packet->assigned_id),
+		(unsigned int)ADDRESS_NODE(packet->assigned_id),
+		(unsigned int)packet->assigned_id
+	);
+
+	if (packet->hop_count == HOP_COUNT_UNKNOWN) {
+		LOG_INF("Hop Count     = unknown");
+	} else {
+		LOG_INF(
+			"Hop Count     = %u",
+			(unsigned int)packet->hop_count
+		);
+	}
+
+	LOG_INF(
 		"Value         = %d",
 		value
 	);
@@ -932,14 +992,30 @@ static void serialize_packet(
 
 
 	sys_put_le16(
-		(uint16_t)packet->value,
+		packet->parent_id,
 		&buffer[8]
 	);
 
 
 	sys_put_le16(
-		packet->sequence,
+		packet->assigned_id,
 		&buffer[10]
+	);
+
+
+	buffer[12] =
+		packet->hop_count;
+
+
+	sys_put_le16(
+		(uint16_t)packet->value,
+		&buffer[13]
+	);
+
+
+	sys_put_le16(
+		packet->sequence,
+		&buffer[15]
 	);
 }
 
@@ -954,10 +1030,11 @@ static bool deserialize_packet(
 	struct oz_packet *packet)
 {
 	/* -----------------------------------------------------
-	 * Exact application payload length required
+	 * Common header must be present; trailing bytes are
+	 * an optional type-specific body (e.g. HEARTBEAT).
 	 * ----------------------------------------------------- */
 
-	if (length != OZ_PACKET_SIZE) {
+	if (length < OZ_PACKET_SIZE) {
 
 		return false;
 	}
@@ -1000,15 +1077,31 @@ static bool deserialize_packet(
 		);
 
 
+	packet->parent_id =
+		sys_get_le16(
+			&buffer[8]
+		);
+
+
+	packet->assigned_id =
+		sys_get_le16(
+			&buffer[10]
+		);
+
+
+	packet->hop_count =
+		buffer[12];
+
+
 	packet->value =
 		(int16_t)sys_get_le16(
-			&buffer[8]
+			&buffer[13]
 		);
 
 
 	packet->sequence =
 		sys_get_le16(
-			&buffer[10]
+			&buffer[15]
 		);
 
 
@@ -1584,7 +1677,7 @@ static __maybe_unused int send_oz_packet(
  * Send application packet + message body
  *
  * Same as send_oz_packet(), but appends a message-specific
- * body (e.g. the HEARTBEAT body) after the 12-byte header.
+ * body (e.g. the HEARTBEAT body) after the OZ header.
  * ========================================================= */
 
 static int send_oz_packet_with_body(
@@ -1734,12 +1827,13 @@ printk("\n");
     }
 
     /*
-     * Ignore anything that is not our OZ packet.
+     * Ignore anything shorter than the common OZ header.
+     * Longer frames may carry a type-specific body.
      */
-    if (received != OZ_PACKET_SIZE) {
+    if (received < OZ_PACKET_SIZE) {
 
         LOG_INF(
-            "Ignoring packet length %d, expected %d",
+            "Ignoring packet length %d, need at least %d",
             (int)received,
             OZ_PACKET_SIZE
         );
@@ -1749,7 +1843,7 @@ printk("\n");
 
     if (!deserialize_packet(
             buffer,
-            received,
+            (size_t)received,
             packet)) {
 
         LOG_INF(
@@ -1941,6 +2035,14 @@ static void build_packet(
 	packet->message_type = message_type;
 	packet->source_id = local_address;
 	packet->destination_id = destination_id;
+	/*
+	 * Default join context from local FSM state. JOIN_RESPONSE
+	 * / ACK builders override assigned_id (and often parent /
+	 * hop) after calling this helper.
+	 */
+	packet->parent_id = parent_address;
+	packet->assigned_id = UNASSIGNED_ADDRESS;
+	packet->hop_count = hop_count;
 	packet->value = value;
 	packet->sequence = sequence;
 }
@@ -2268,11 +2370,16 @@ static void handle_heartbeat(
 	*/
 
 	LOG_INF(
-		"HEARTBEAT seq=%u from 0x%04X accepted",
+		"HEARTBEAT seq=%u from %u:%u accepted (parent=%u:%u hop=%u)",
 		(unsigned int)packet->sequence,
-		(unsigned int)packet->source_id
+		(unsigned int)ADDRESS_NETWORK(packet->source_id),
+		(unsigned int)ADDRESS_NODE(packet->source_id),
+		(unsigned int)ADDRESS_NETWORK(packet->parent_id),
+		(unsigned int)ADDRESS_NODE(packet->parent_id),
+		(unsigned int)packet->hop_count
 	);
 
+	print_packet("HEARTBEAT RX", packet);
 	print_heartbeat_body("HEARTBEAT RX BODY", &body, packet->value);
 
 	LOG_INF("K reset to %u s", probe_k_seconds);
@@ -2283,17 +2390,219 @@ static void handle_heartbeat(
 
 
 /*
+ * JOIN_REQUEST: joining node asks the selected parent / root
+ * for an address. Allocation + JOIN_RESPONSE TX land in the
+ * join-protocol milestone; Section 3 only decodes and logs.
+ */
+static void handle_join_request(
+	const struct oz_packet *packet,
+	const struct received_frame *frame)
+{
+	ARG_UNUSED(frame);
+
+	print_packet("JOIN_REQUEST RX", packet);
+
+	LOG_INF(
+		"JOIN_REQUEST seq=%u from %u:%u parent=%u:%u hop=%u",
+		(unsigned int)packet->sequence,
+		(unsigned int)ADDRESS_NETWORK(packet->source_id),
+		(unsigned int)ADDRESS_NODE(packet->source_id),
+		(unsigned int)ADDRESS_NETWORK(packet->parent_id),
+		(unsigned int)ADDRESS_NODE(packet->parent_id),
+		(unsigned int)packet->hop_count
+	);
+
+	if (!address_is_root(local_address) ||
+	    (current_state != NODE_REGISTERED)) {
+		LOG_INF(
+			"JOIN_REQUEST ignored (local=%u:%u state=%s; root REGISTERED handles allocation)",
+			(unsigned int)ADDRESS_NETWORK(local_address),
+			(unsigned int)ADDRESS_NODE(local_address),
+			node_state_name(current_state)
+		);
+		return;
+	}
+
+	LOG_INF(
+		"JOIN_REQUEST accepted for decode; address allocation not yet implemented"
+	);
+}
+
+
+/*
+ * JOIN_RESPONSE: root grants assigned address + parent + hop.
+ * Applying set_local_address() / JOIN_ACKNOWLEDGE is Milestone 5.
+ */
+static void handle_join_response(
+	const struct oz_packet *packet,
+	const struct received_frame *frame)
+{
+	ARG_UNUSED(frame);
+
+	print_packet("JOIN_RESPONSE RX", packet);
+
+	LOG_INF(
+		"JOIN_RESPONSE seq=%u assigned=%u:%u parent=%u:%u hop=%u",
+		(unsigned int)packet->sequence,
+		(unsigned int)ADDRESS_NETWORK(packet->assigned_id),
+		(unsigned int)ADDRESS_NODE(packet->assigned_id),
+		(unsigned int)ADDRESS_NETWORK(packet->parent_id),
+		(unsigned int)ADDRESS_NODE(packet->parent_id),
+		(unsigned int)packet->hop_count
+	);
+
+	if ((current_state != NODE_PROBING) &&
+	    (current_state != NODE_WAITING_FOR_JOIN_RESPONSE)) {
+		LOG_INF(
+			"JOIN_RESPONSE ignored (state=%s; expected PROBING or WAITING_FOR_JOIN_RESPONSE)",
+			node_state_name(current_state)
+		);
+		return;
+	}
+
+	LOG_INF(
+		"JOIN_RESPONSE accepted for decode; registration / JOIN_ACKNOWLEDGE not yet implemented"
+	);
+}
+
+
+/*
+ * JOIN_ACKNOWLEDGE: joiner confirms the assigned address.
+ * Root-side table activation is Milestone 5.
+ */
+static void handle_join_acknowledge(
+	const struct oz_packet *packet,
+	const struct received_frame *frame)
+{
+	ARG_UNUSED(frame);
+
+	print_packet("JOIN_ACKNOWLEDGE RX", packet);
+
+	LOG_INF(
+		"JOIN_ACKNOWLEDGE seq=%u assigned=%u:%u parent=%u:%u hop=%u",
+		(unsigned int)packet->sequence,
+		(unsigned int)ADDRESS_NETWORK(packet->assigned_id),
+		(unsigned int)ADDRESS_NODE(packet->assigned_id),
+		(unsigned int)ADDRESS_NETWORK(packet->parent_id),
+		(unsigned int)ADDRESS_NODE(packet->parent_id),
+		(unsigned int)packet->hop_count
+	);
+
+	if (!address_is_root(local_address) ||
+	    (current_state != NODE_REGISTERED)) {
+		LOG_INF(
+			"JOIN_ACKNOWLEDGE ignored (local=%u:%u state=%s)",
+			(unsigned int)ADDRESS_NETWORK(local_address),
+			(unsigned int)ADDRESS_NODE(local_address),
+			node_state_name(current_state)
+		);
+		return;
+	}
+
+	LOG_INF(
+		"JOIN_ACKNOWLEDGE accepted for decode; address-table activate not yet implemented"
+	);
+}
+
+
+/*
+ * DATA: sensor traffic toward the root. Generation and
+ * parent forwarding are Milestone 6; Section 3 only logs.
+ */
+static void handle_data(
+	const struct oz_packet *packet,
+	const struct received_frame *frame)
+{
+	ARG_UNUSED(frame);
+
+	print_packet("DATA RX", packet);
+
+	LOG_INF(
+		"DATA seq=%u value=%d from %u:%u hop=%u",
+		(unsigned int)packet->sequence,
+		(int)packet->value,
+		(unsigned int)ADDRESS_NETWORK(packet->source_id),
+		(unsigned int)ADDRESS_NODE(packet->source_id),
+		(unsigned int)packet->hop_count
+	);
+
+	if (!node_can_send_data() && !address_is_root(local_address)) {
+		LOG_INF(
+			"DATA ignored (state=%s; only REGISTERED nodes forward)",
+			node_state_name(current_state)
+		);
+		return;
+	}
+
+	if (address_is_root(local_address)) {
+		LOG_INF(
+			"DATA at root; collection / missing-seq reporting not yet implemented"
+		);
+		return;
+	}
+
+	LOG_INF(
+		"DATA forward candidate toward parent %u:%u; forwarding not yet implemented",
+		(unsigned int)ADDRESS_NETWORK(parent_address),
+		(unsigned int)ADDRESS_NODE(parent_address)
+	);
+}
+
+
+/*
+ * NETIDREQ / NETIDRESP: reserved for multi-network ID
+ * discovery. Decode + log only until that design lands.
+ */
+static void handle_netid_request(
+	const struct oz_packet *packet,
+	const struct received_frame *frame)
+{
+	ARG_UNUSED(frame);
+
+	print_packet("NETID_REQUEST RX", packet);
+
+	LOG_INF(
+		"NETID_REQUEST seq=%u from %u:%u (multi-net reserved; not implemented)",
+		(unsigned int)packet->sequence,
+		(unsigned int)ADDRESS_NETWORK(packet->source_id),
+		(unsigned int)ADDRESS_NODE(packet->source_id)
+	);
+}
+
+
+static void handle_netid_response(
+	const struct oz_packet *packet,
+	const struct received_frame *frame)
+{
+	ARG_UNUSED(frame);
+
+	print_packet("NETID_RESPONSE RX", packet);
+
+	LOG_INF(
+		"NETID_RESPONSE seq=%u from %u:%u assigned_hint=%u:%u (multi-net reserved; not implemented)",
+		(unsigned int)packet->sequence,
+		(unsigned int)ADDRESS_NETWORK(packet->source_id),
+		(unsigned int)ADDRESS_NODE(packet->source_id),
+		(unsigned int)ADDRESS_NETWORK(packet->assigned_id),
+		(unsigned int)ADDRESS_NODE(packet->assigned_id)
+	);
+}
+
+
+/*
  * Indexed by (message_type - MSG_TYPE_FIRST).
- * NULL entries are reserved for handlers not yet implemented.
+ * Every assignment type 1–8 has a handler; join / DATA /
+ * NETID bodies still evolve in later milestones.
  */
 static const message_handler_t message_handlers[MSG_HANDLER_COUNT] = {
-	[MSG_TYPE_PROBE          - MSG_TYPE_FIRST] = handle_probe,
-	[MSG_TYPE_HEARTBEAT      - MSG_TYPE_FIRST] = handle_heartbeat,
-	[MSG_TYPE_JOIN_REQUEST   - MSG_TYPE_FIRST] = NULL,
-	[MSG_TYPE_JOIN_RESPONSE  - MSG_TYPE_FIRST] = NULL,
-	[MSG_TYPE_JOIN_ACK       - MSG_TYPE_FIRST] = NULL,
-	[MSG_TYPE_NETID_REQUEST  - MSG_TYPE_FIRST] = NULL,
-	[MSG_TYPE_NETID_RESPONSE - MSG_TYPE_FIRST] = NULL,
+	[MSG_TYPE_PROBE            - MSG_TYPE_FIRST] = handle_probe,
+	[MSG_TYPE_HEARTBEAT        - MSG_TYPE_FIRST] = handle_heartbeat,
+	[MSG_TYPE_JOIN_REQUEST     - MSG_TYPE_FIRST] = handle_join_request,
+	[MSG_TYPE_JOIN_RESPONSE    - MSG_TYPE_FIRST] = handle_join_response,
+	[MSG_TYPE_JOIN_ACKNOWLEDGE - MSG_TYPE_FIRST] = handle_join_acknowledge,
+	[MSG_TYPE_DATA             - MSG_TYPE_FIRST] = handle_data,
+	[MSG_TYPE_NETID_REQUEST    - MSG_TYPE_FIRST] = handle_netid_request,
+	[MSG_TYPE_NETID_RESPONSE   - MSG_TYPE_FIRST] = handle_netid_response,
 };
 
 

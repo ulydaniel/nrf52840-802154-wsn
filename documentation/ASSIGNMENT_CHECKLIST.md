@@ -102,46 +102,45 @@ UNREGISTERED → PROBING → WAITING_FOR_JOIN_RESPONSE → REGISTERED
 
 ## 3. Application message types
 
-Assignment numbering (align code or document intentional remapping):
+**Doc:** `documentation/SECTION3_MESSAGE_TYPES.md`  
+Assignment numbering (aligned in code; `PROTOCOL_VERSION` **2**, 17-byte common header):
 
 | Type | Value | Status |
 |------|------:|--------|
-| PROBE | 1 | [~] Exists; semantics need rewrite |
-| HEARTBEAT | 2 | [~] Exists; fields / who sends need rewrite |
-| JOIN_REQUEST | 3 | [ ] Handler missing (`NULL`) |
-| JOIN_RESPONSE | 4 | [ ] Handler missing (`NULL`) |
-| JOIN_ACKNOWLEDGE | 5 | [ ] Handler missing (`NULL`) |
-| DATA | 6 | [ ] Not implemented (legacy DATA `#if 0` is unrelated fixed demo) |
-| NETIDREQ | 7 | [ ] Reserved / not implemented |
-| NETIDRESP | 8 | [ ] Reserved / not implemented |
-
-**Current code note:** handlers table uses JOIN 3–5 and NETID as 6–7 (no DATA=6). Align with PDF or document the difference.
+| PROBE | 1 | [x] Defined + `handle_probe` |
+| HEARTBEAT | 2 | [x] Defined + `handle_heartbeat` (body still GUID/battery) |
+| JOIN_REQUEST | 3 | [x] `handle_join_request` (decode/log; allocation later) |
+| JOIN_RESPONSE | 4 | [x] `handle_join_response` (decode/log; registration later) |
+| JOIN_ACKNOWLEDGE | 5 | [x] `handle_join_acknowledge` (decode/log; table activate later) |
+| DATA | 6 | [x] `handle_data` (decode/log; generate/forward later) |
+| NETIDREQ | 7 | [x] `handle_netid_request` (reserved multi-net) |
+| NETIDRESP | 8 | [x] `handle_netid_response` (reserved multi-net) |
 
 Checklist:
 
-- [~] PROBE type defined and handled
-- [~] HEARTBEAT type defined and handled
-- [ ] JOIN_REQUEST handler
-- [ ] JOIN_RESPONSE handler
-- [ ] JOIN_ACKNOWLEDGE handler
-- [ ] DATA handler (+ generation / forwarding)
-- [ ] NETIDREQ handler (if used / required for multi-net later)
-- [ ] NETIDRESP handler (if used)
-- [ ] Same serialize/deserialize format used consistently
-- [ ] Document final packet format (common header + type-specific fields/body)
+- [x] PROBE type defined and handled
+- [x] HEARTBEAT type defined and handled
+- [x] JOIN_REQUEST handler
+- [x] JOIN_RESPONSE handler
+- [x] JOIN_ACKNOWLEDGE handler
+- [x] DATA handler (generation / forwarding still §4 / M6)
+- [x] NETIDREQ handler (reserved; logs only)
+- [x] NETIDRESP handler (reserved; logs only)
+- [x] Same serialize/deserialize format used consistently (`serialize_packet` / `deserialize_packet`)
+- [x] Document final packet format (common header + type-specific fields/body) — see `SECTION3_MESSAGE_TYPES.md`
 
 ### Suggested / example fields (extend current OZ header or add bodies)
 
-- [~] Signature (2) — have `"OZ"`
-- [~] Protocol version (1) — have
-- [~] Message type (1) — have
-- [~] Source address (2) — have
-- [~] Destination address (2) — have
-- [ ] Parent address (2)
-- [ ] Assigned address (2)
-- [ ] Hop count (1)
-- [~] Sequence number (2) — have
-- [~] Payload / sensor value (2) — `value` field exists; wire into DATA semantics
+- [x] Signature (2) — `"OZ"`
+- [x] Protocol version (1) — `PROTOCOL_VERSION` 2
+- [x] Message type (1)
+- [x] Source address (2)
+- [x] Destination address (2)
+- [x] Parent address (2) — `parent_id`
+- [x] Assigned address (2) — `assigned_id`
+- [x] Hop count (1) — `hop_count` (`0xFF` = unknown)
+- [x] Sequence number (2)
+- [x] Payload / sensor value (2) — `value` (DATA semantics / TX loop later)
 
 ---
 
@@ -261,8 +260,8 @@ struct address_record {
 
 ## 7. Implementation milestones (assignment §11)
 
-- [~] **M1** Packet format — serialization, version checks, type handling work *(extend for join/data fields)*
-- [~] **M2** Discovery — PROBE + HEARTBEAT *(rewrite to assignment semantics)*
+- [x] **M1** Packet format — serialization, version checks, types 1–8, parent/assigned/hop *(see §3 / `SECTION3_MESSAGE_TYPES.md`)*
+- [~] **M2** Discovery — PROBE + HEARTBEAT *(broadcast path present; parent-selection rewrite still §4)*
 - [ ] **M3** Parent selection — joining node selects and records eligible parent
 - [ ] **M4** Address assignment — root JOIN_REQUEST → unique JOIN_RESPONSE
 - [ ] **M5** Registration — apply address + JOIN_ACKNOWLEDGE exchange
@@ -312,8 +311,8 @@ Logs should clearly show when relevant:
 ## 10. Required deliverables (§14)
 
 - [~] Modified C source code *(in progress; join/tree not done)*
-- [ ] Protocol description and message-format table
-- [ ] Node state-machine diagram
+- [~] Protocol description and message-format table *(§3 doc done; full protocol writeup later)*
+- [~] Node state-machine diagram *(§2 FSM doc; formal diagram later)*
 - [ ] Address-allocation explanation
 - [ ] Test results with serial-log evidence
 - [ ] Wireshark screenshots or packet captures
@@ -353,7 +352,7 @@ Logs should clearly show when relevant:
 
 | Component | Points | Progress |
 |-----------|-------:|----------|
-| Packet format and serialization | 15 | [~] Base done; extend for protocol fields |
+| Packet format and serialization | 15 | [x] §3 complete (v2 header + handlers) |
 | Probe and heartbeat implementation | 15 | [~] Present; needs assignment semantics |
 | Parent selection | 10 | [ ] |
 | Join request and response | 20 | [ ] |
@@ -369,9 +368,9 @@ Logs should clearly show when relevant:
 
 Use this as the working sequence:
 
-1. [ ] Address macros + root vs non-root startup + FSM skeleton + logging of state
-2. [ ] Align message-type numbers; extend packet fields (parent, assigned, hop)
-3. [ ] Rewrite PROBE (broadcast from unassigned) and HEARTBEAT (registered reply)
+1. [x] Address macros + root vs non-root startup + FSM skeleton + logging of state
+2. [x] Align message-type numbers; extend packet fields (parent, assigned, hop)
+3. [~] Rewrite PROBE (broadcast from unassigned) and HEARTBEAT (registered reply) — mostly done; parent-selection fields already on HB header
 4. [ ] Parent selection window + document policy
 5. [ ] JOIN_REQUEST / JOIN_RESPONSE / JOIN_ACK + root `address_record` table
 6. [ ] Apply short address on registration; block DATA until REGISTERED
@@ -386,15 +385,16 @@ Use this as the working sequence:
 | Area | Status |
 |------|--------|
 | Radio + OZ framing + RX/TX on all nodes | **Done** |
-| Version / signature filtering | **Done** |
-| PROBE / HEARTBEAT (root listens; joining broadcasts) | **Partial — join/parent rewrite still needed** |
+| Version / signature filtering | **Done** (v2) |
+| Message types 1–8 + common header fields | **Done** (see `SECTION3_MESSAGE_TYPES.md`) |
+| PROBE / HEARTBEAT (root listens; joining broadcasts) | **Partial — parent selection / join TX still §4** |
 | Addressing (`1:254`, unassigned, broadcast, pool helpers) | **Done** (see `SECTION1_ADDRESSING.md`) |
 | Node FSM | **Done** (see `SECTION2_NODE_FSM.md`; join-driven transitions pending) |
 | Parent selection | **Not started** |
-| Join request / response / ack | **Not started** (type slots reserved) |
+| Join request / response / ack | **Handlers decode/log; TX + allocation not started** |
 | Root address allocation table | **Not started** |
-| DATA collection + forwarding | **Not started** |
+| DATA collection + forwarding | **Handler only; generate/forward not started** |
 | Join reliability / duplicates | **Not started** |
 | Demo, tests, docs, Wireshark | **Not started** |
 
-**Bottom line:** Keep the radio and packet plumbing. Replace fixed sender/receiver roles with root + joining FSM, then implement discovery → join → DATA tree on top.
+**Bottom line:** Types + packet format are assignment-aligned. Next: parent selection and JOIN TX/RX driving the FSM (§4 / M3–M5), then DATA tree (M6).
