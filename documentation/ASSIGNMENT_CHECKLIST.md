@@ -86,17 +86,17 @@ UNREGISTERED → PROBING → WAITING_FOR_JOIN_RESPONSE → REGISTERED
   - [x] `NODE_REGISTERED`
 - [x] **UNREGISTERED:** no assigned address; cannot send normal DATA (`node_can_send_data()`)
 - [x] **PROBING:** periodically broadcast PROBE; listen for HEARTBEAT (gated + joining `node_fsm_init`)
-- [x] **WAITING_FOR_JOIN_RESPONSE:** helper `node_enter_waiting_for_join_response()` ready; join TX not wired yet
-- [x] **REGISTERED:** root boots here with parent/hop; DATA send loop still future
+- [x] **WAITING_FOR_JOIN_RESPONSE:** entered after parent selection; JOIN_REQUEST outstanding
+- [x] **REGISTERED:** root boots here; joiners enter via JOIN_RESPONSE + `node_enter_registered()`; DATA send loop still §4.7
 - [x] Root starts already **REGISTERED** at **1:254** (hop 0, parent = self / `ROOT_ADDRESS`)
 - [x] Non-root nodes start **UNREGISTERED** / enter **PROBING** (`node_fsm_init`)
-- [x] Revert to UNREGISTERED helper (`node_revert_to_unregistered`); call sites on join failure still future
+- [x] Revert to UNREGISTERED on join timeout / registration abort (`node_revert_to_unregistered`)
 - [x] Single firmware path that can be root **or** joining node (`ROLE_ROOT` / `ROLE_JOINING`)
 
 ### Current state vs FSM
 
 - [x] Compile-time `ROLE_ROOT` / `ROLE_JOINING` with correct boot addresses + FSM
-- [~] Full join / registration state machine (states + transitions exist; JOIN messages not driving them yet)
+- [x] Full join / registration state machine (PROBE→HB→JOIN drives UNREGISTERED…REGISTERED; see `SECTION4_PROTOCOL_FLOW.md`)
 
 ---
 
@@ -109,9 +109,9 @@ Assignment numbering (aligned in code; `PROTOCOL_VERSION` **2**, 17-byte common 
 |------|------:|--------|
 | PROBE | 1 | [x] Defined + `handle_probe` |
 | HEARTBEAT | 2 | [x] Defined + `handle_heartbeat` (body still GUID/battery) |
-| JOIN_REQUEST | 3 | [x] `handle_join_request` (decode/log; allocation later) |
-| JOIN_RESPONSE | 4 | [x] `handle_join_response` (decode/log; registration later) |
-| JOIN_ACKNOWLEDGE | 5 | [x] `handle_join_acknowledge` (decode/log; table activate later) |
+| JOIN_REQUEST | 3 | [x] `handle_join_request` (root allocates / retransmits) |
+| JOIN_RESPONSE | 4 | [x] `handle_join_response` (joiner registers + ACK) |
+| JOIN_ACKNOWLEDGE | 5 | [x] `handle_join_acknowledge` (root marks active) |
 | DATA | 6 | [x] `handle_data` (decode/log; generate/forward later) |
 | NETIDREQ | 7 | [x] `handle_netid_request` (reserved multi-net) |
 | NETIDRESP | 8 | [x] `handle_netid_response` (reserved multi-net) |
@@ -152,71 +152,73 @@ PROBE → HEARTBEAT → JOIN REQUEST → JOIN RESPONSE → JOIN ACKNOWLEDGE
 
 Then (registered): periodic **DATA** toward root.
 
+**Doc:** `documentation/SECTION4_PROTOCOL_FLOW.md`
+
 ### 4.1 Probe (unregistered / probing node)
 
-- [ ] Periodically transmit **broadcast** PROBE
-- [ ] Source = unassigned address (`0xFFFE` / 255:254)
-- [ ] Destination = broadcast (`0xFFFF`)
-- [ ] Include sequence number
-- [ ] Retransmit PROBE on timeout if no eligible heartbeat
-- [ ] Revert toward unregistered / re-probe if join fails
-- [~] Current PROBE is unicast from fixed sender to fixed receiver — **rewrite**
+- [x] Periodically transmit **broadcast** PROBE
+- [x] Source = unassigned address (`0xFFFE` / 255:254)
+- [x] Destination = broadcast (`0xFFFF`)
+- [x] Include sequence number
+- [x] Retransmit PROBE on timeout if no eligible heartbeat
+- [x] Revert toward unregistered / re-probe if join fails
+- [x] Broadcast from unassigned (no longer fixed unicast peer model)
 
 ### 4.2 Heartbeat (registered node answering a probe)
 
-- [ ] Registered node responds to PROBE with HEARTBEAT
-- [ ] Registered source address
-- [ ] Parent address of responding node
-- [ ] Hop count from responder to root
-- [ ] Optional RSSI / LQI from the **received probe** (have RSSI plumbing)
-- [~] Current HEARTBEAT is only from fixed receiver, with GUID/battery body — **rewrite fields / who may send**
+- [x] Registered node responds to PROBE with HEARTBEAT
+- [x] Registered source address
+- [x] Parent address of responding node
+- [x] Hop count from responder to root
+- [x] Optional RSSI / LQI from the **received probe** (`value` = probe RSSI; GUID/battery body kept)
+- [x] Any `REGISTERED` node may reply (`node_can_reply_heartbeat`)
 
 ### 4.3 Parent selection
 
-- [ ] Collect multiple heartbeats during a selection window
-- [ ] Document selection algorithm
-- [ ] Minimum policy:
+- [x] Collect multiple heartbeats during a selection window
+- [x] Document selection algorithm (`SECTION4_PROTOCOL_FLOW.md` §5)
+- [x] Minimum policy:
   1. Lowest hop count
   2. If tie: strongest RSSI
   3. If tie / no RSSI: lowest address
-- [ ] Record selected parent before JOIN_REQUEST
+- [x] Record selected parent before JOIN_REQUEST
 
 ### 4.4 Join request
 
-- [ ] Send JOIN_REQUEST after parent selection
-- [ ] Source = unassigned
-- [ ] Parent field = selected parent
-- [ ] Identify / direct request toward root (per protocol design)
-- [ ] Include sequence number
-- [ ] Start response timer after TX
-- [ ] On failure: retransmit JOIN_REQUEST **or** return to UNREGISTERED / PROBING
+- [x] Send JOIN_REQUEST after parent selection
+- [x] Source = unassigned
+- [x] Parent field = selected parent
+- [x] Identify / direct request toward root (`destination = ROOT_ADDRESS`)
+- [x] Include sequence number (+ join nonce in `value`)
+- [x] Start response timer after TX
+- [x] On failure: retransmit JOIN_REQUEST **or** return to UNREGISTERED / PROBING
 
 ### 4.5 Join response (root)
 
-- [ ] Root validates JOIN_REQUEST
-- [ ] Allocate unique address from pool
-- [ ] Response includes assigned address, selected parent, hop count
-- [ ] No duplicate allocations
-- [ ] Pending address reserved until ACK success or timeout
-- [ ] Address pool exhausted → report join failure
-- [ ] Duplicate request → **retransmit original response**, do not allocate again
+- [x] Root validates JOIN_REQUEST
+- [x] Allocate unique address from pool
+- [x] Response includes assigned address, selected parent, hop count
+- [x] No duplicate allocations
+- [x] Pending address reserved until ACK success or timeout
+- [x] Address pool exhausted → report join failure
+- [x] Duplicate request → **retransmit original response**, do not allocate again
 
 ### 4.6 Join acknowledge
 
-- [ ] On valid JOIN_RESPONSE: store assigned address + parent
-- [ ] Transition to REGISTERED
-- [ ] Send JOIN_ACKNOWLEDGE
-- [ ] Configure IEEE 802.15.4 short address when required
-- [ ] Do not send normal DATA before registration complete
-- [ ] Root marks node **active** after ACK
+- [x] On valid JOIN_RESPONSE: store assigned address + parent
+- [x] Transition to REGISTERED
+- [x] Send JOIN_ACKNOWLEDGE
+- [x] Configure IEEE 802.15.4 short address when required
+- [x] Do not send normal DATA before registration complete (`node_can_send_data`)
+- [x] Root marks node **active** after ACK
 
 ### 4.7 Data collection (after registration)
 
-- [ ] Registered node generates sensor message **every 1 second**
-- [ ] Sensor value = sequential number
-- [ ] Send / forward toward root (via parent)
-- [ ] Root records and reports **missing** sensor data packets
-- [ ] Child DATA reaches root through parent (multi-hop when needed)
+- [x] Registered node generates sensor message **every 1 second** (`data_timer` / `TX_PERIOD_MS`)
+- [x] Sensor value = sequential number (`sensor_value`)
+- [x] Send / forward toward root (via parent) (`send_sensor_data` / `forward_data_to_parent`)
+- [x] Root records and reports **missing** sensor data packets (`root_collect_data`)
+- [x] Child DATA reaches root through parent (multi-hop when needed; origin `source_id` preserved)
 
 ---
 
@@ -228,45 +230,49 @@ struct address_record {
     uint16_t parent;
     uint8_t hop_count;
     uint16_t request_sequence;
+    uint16_t join_nonce;   /* distinguishes concurrent 0xFFFE joiners */
+    uint16_t requester_mac;
     bool pending;
     bool active;
+    bool in_use;
+    int64_t pending_deadline_ms;
 };
 ```
 
-- [ ] Address-allocation table (or equivalent) on root
-- [ ] Start allocation at **1:1**
-- [ ] Skip reserved / broadcast / root addresses
-- [ ] Support **at least three** joining nodes
-- [ ] Reserve address while waiting for ACK (`pending`)
-- [ ] Mark `active` after JOIN_ACK
-- [ ] Reuse address only after failed transaction explicitly released
-- [ ] Concurrent requests: resolve so assignment stays accurate (no double-issue)
-- [ ] Root allocates each live address only once while in use
+- [x] Address-allocation table (or equivalent) on root
+- [x] Start allocation at **1:1**
+- [x] Skip reserved / broadcast / root addresses
+- [x] Support **at least three** joining nodes (`ADDRESS_TABLE_CAPACITY` 16)
+- [x] Reserve address while waiting for ACK (`pending`)
+- [x] Mark `active` after JOIN_ACK
+- [x] Reuse address only after failed transaction explicitly released
+- [x] Concurrent requests: resolve so assignment stays accurate (no double-issue; keyed by join nonce)
+- [x] Root allocates each live address only once while in use
 
 ---
 
 ## 6. Reliability requirements
 
-- [ ] Waiting for heartbeat → retransmit PROBE after timeout
-- [ ] Waiting for join response → retransmit JOIN_REQUEST **or** back to unregistered + PROBE
-- [ ] Waiting for join ACK → retransmit JOIN_RESPONSE **or** release pending address on timeout
-- [ ] Duplicate JOIN_REQUEST → do not allocate a second address
-- [ ] Invalid packet (bad signature / version) → ignore + diagnostic log
-- [ ] Every control message includes a sequence number
-- [ ] Detect duplicate join requests and duplicate responses
-- [~] Current probe K backoff / stale HB ignore — useful patterns, not full join reliability
+- [x] Waiting for heartbeat → retransmit PROBE after timeout
+- [x] Waiting for join response → retransmit JOIN_REQUEST **or** back to unregistered + PROBE
+- [x] Waiting for join ACK → release pending address on timeout (retransmit JOIN_RESPONSE on duplicate REQUEST)
+- [x] Duplicate JOIN_REQUEST → do not allocate a second address
+- [x] Invalid packet (bad signature / version) → ignore + diagnostic log
+- [x] Every control message includes a sequence number
+- [x] Detect duplicate join requests and duplicate responses (nonce + sequence)
+- [~] Probe K backoff / stale HB ignore retained; fuller loss demos still open
 
 ---
 
 ## 7. Implementation milestones (assignment §11)
 
 - [x] **M1** Packet format — serialization, version checks, types 1–8, parent/assigned/hop *(see §3 / `SECTION3_MESSAGE_TYPES.md`)*
-- [~] **M2** Discovery — PROBE + HEARTBEAT *(broadcast path present; parent-selection rewrite still §4)*
-- [ ] **M3** Parent selection — joining node selects and records eligible parent
-- [ ] **M4** Address assignment — root JOIN_REQUEST → unique JOIN_RESPONSE
-- [ ] **M5** Registration — apply address + JOIN_ACKNOWLEDGE exchange
-- [ ] **M6** Data collection — registered nodes send/forward DATA to root
-- [ ] **M7** Reliability — timeouts, retransmissions, duplicates, failure recovery demonstrated
+- [x] **M2** Discovery — PROBE + HEARTBEAT *(broadcast + registered reply)*
+- [x] **M3** Parent selection — joining node selects and records eligible parent
+- [x] **M4** Address assignment — root JOIN_REQUEST → unique JOIN_RESPONSE
+- [x] **M5** Registration — apply address + JOIN_ACKNOWLEDGE exchange
+- [x] **M6** Data collection — registered nodes send/forward DATA to root
+- [~] **M7** Reliability — join retries + pending release + DATA gap logs; full demo suite still open
 
 ---
 
@@ -338,13 +344,13 @@ Logs should clearly show when relevant:
 ## 12. Implementation constraints (must not violate)
 
 - [x] Preserve IEEE 802.15.4 config + packet-socket approach unless justified
-- [ ] Do not hard-code addresses of all participating nodes
-- [ ] Do not assign all addresses at compile time
-- [ ] Do not bypass the join protocol
-- [ ] Do not treat every packet as a DATA packet
-- [ ] Do not remove sequence numbers or timeout handling
-- [ ] Document any packet-format changes or Zephyr address-config assumptions
-- [ ] Final demo: addresses assigned **dynamically** through joining protocol
+- [x] Do not hard-code addresses of all participating nodes
+- [x] Do not assign all addresses at compile time
+- [x] Do not bypass the join protocol
+- [x] Do not treat every packet as a DATA packet
+- [x] Do not remove sequence numbers or timeout handling
+- [~] Document any packet-format changes or Zephyr address-config assumptions *(§1–§4 docs; expand in final writeup)*
+- [~] Final demo: addresses assigned **dynamically** through joining protocol *(code ready; hardware demo open)*
 
 ---
 
@@ -353,13 +359,13 @@ Logs should clearly show when relevant:
 | Component | Points | Progress |
 |-----------|-------:|----------|
 | Packet format and serialization | 15 | [x] §3 complete (v2 header + handlers) |
-| Probe and heartbeat implementation | 15 | [~] Present; needs assignment semantics |
-| Parent selection | 10 | [ ] |
-| Join request and response | 20 | [ ] |
-| Address allocation | 15 | [ ] |
-| Join acknowledgment and state transitions | 10 | [ ] |
-| Reliability and duplicate handling | 10 | [ ] Partial probe-only patterns |
-| Testing and documentation | 5 | [ ] |
+| Probe and heartbeat implementation | 15 | [x] Broadcast PROBE + REGISTERED HEARTBEAT |
+| Parent selection | 10 | [x] Window + hop/RSSI/addr policy |
+| Join request and response | 20 | [x] TX/RX + allocation |
+| Address allocation | 15 | [x] Root table + pending/active |
+| Join acknowledgment and state transitions | 10 | [x] REGISTERED + ACK activate |
+| Reliability and duplicate handling | 10 | [~] Join retries + nonce duplicates + DATA gaps; expand demos |
+| Testing and documentation | 5 | [~] §4 doc done; hardware tests open |
 | **Total** | **100** | |
 
 ---
@@ -370,12 +376,12 @@ Use this as the working sequence:
 
 1. [x] Address macros + root vs non-root startup + FSM skeleton + logging of state
 2. [x] Align message-type numbers; extend packet fields (parent, assigned, hop)
-3. [~] Rewrite PROBE (broadcast from unassigned) and HEARTBEAT (registered reply) — mostly done; parent-selection fields already on HB header
-4. [ ] Parent selection window + document policy
-5. [ ] JOIN_REQUEST / JOIN_RESPONSE / JOIN_ACK + root `address_record` table
-6. [ ] Apply short address on registration; block DATA until REGISTERED
-7. [ ] 1 Hz DATA + forward to parent + root missing-seq reporting
-8. [ ] Timers / retransmits / duplicates / failure recovery
+3. [x] Rewrite PROBE (broadcast from unassigned) and HEARTBEAT (registered reply)
+4. [x] Parent selection window + document policy (`SECTION4_PROTOCOL_FLOW.md`)
+5. [x] JOIN_REQUEST / JOIN_RESPONSE / JOIN_ACK + root `address_record` table
+6. [x] Apply short address on registration; block DATA until REGISTERED
+7. [x] 1 Hz DATA + forward to parent + root missing-seq reporting
+8. [~] Timers / retransmits / duplicates / failure recovery *(join + DATA gaps done; expand with demos)*
 9. [ ] Hardware demo (1 root + ≥2 nodes) + Wireshark + writeup / design Qs
 
 ---
@@ -387,14 +393,14 @@ Use this as the working sequence:
 | Radio + OZ framing + RX/TX on all nodes | **Done** |
 | Version / signature filtering | **Done** (v2) |
 | Message types 1–8 + common header fields | **Done** (see `SECTION3_MESSAGE_TYPES.md`) |
-| PROBE / HEARTBEAT (root listens; joining broadcasts) | **Partial — parent selection / join TX still §4** |
+| PROBE / HEARTBEAT (root listens; joining broadcasts) | **Done** |
 | Addressing (`1:254`, unassigned, broadcast, pool helpers) | **Done** (see `SECTION1_ADDRESSING.md`) |
-| Node FSM | **Done** (see `SECTION2_NODE_FSM.md`; join-driven transitions pending) |
-| Parent selection | **Not started** |
-| Join request / response / ack | **Handlers decode/log; TX + allocation not started** |
-| Root address allocation table | **Not started** |
-| DATA collection + forwarding | **Handler only; generate/forward not started** |
-| Join reliability / duplicates | **Not started** |
-| Demo, tests, docs, Wireshark | **Not started** |
+| Node FSM | **Done** (join-driven; see `SECTION2_NODE_FSM.md` + `SECTION4_PROTOCOL_FLOW.md`) |
+| Parent selection | **Done** |
+| Join request / response / ack | **Done** |
+| Root address allocation table | **Done** (see §5) |
+| DATA collection + forwarding | **Done** (1 Hz + parent forward + root missing-seq) |
+| Join reliability / duplicates | **Basic path done; fuller demos open** |
+| Demo, tests, docs, Wireshark | **§4 doc done; hardware demo open** |
 
-**Bottom line:** Types + packet format are assignment-aligned. Next: parent selection and JOIN TX/RX driving the FSM (§4 / M3–M5), then DATA tree (M6).
+**Bottom line:** §4.1–4.7 complete — join through `REGISTERED` plus 1 Hz DATA to root. Next: hardware demo / Wireshark / writeup.

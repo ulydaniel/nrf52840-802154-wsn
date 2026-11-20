@@ -19,8 +19,8 @@ UNREGISTERED → PROBING → WAITING_FOR_JOIN_RESPONSE → REGISTERED
 |-------|--------------------------------|---------------------|
 | `NODE_UNREGISTERED` | No assigned address; cannot send normal DATA | Boot state for joining nodes; DATA blocked |
 | `NODE_PROBING` | Periodically broadcast PROBE; listen for HEARTBEAT | Joining nodes enter this after radio up; probe timer gated |
-| `NODE_WAITING_FOR_JOIN_RESPONSE` | Parent selected; waiting for assigned address | Helper ready (`node_enter_waiting_for_join_response`); join TX not yet |
-| `NODE_REGISTERED` | Address + parent + route; send periodic sensor DATA | Root boots here; DATA still future milestone |
+| `NODE_WAITING_FOR_JOIN_RESPONSE` | Parent selected; waiting for assigned address | Entered after parent selection; JOIN_REQUEST outstanding |
+| `NODE_REGISTERED` | Address + parent + route; send periodic sensor DATA | Root boots here; joiners enter via JOIN_RESPONSE + 1 Hz DATA (§4.7) |
 
 ---
 
@@ -144,7 +144,7 @@ Concrete call sites:
 
 ---
 
-## 5. Intended later transitions (helpers ready)
+## 5. Join-driven transitions (implemented in §4)
 
 ```text
 Joining:
@@ -161,11 +161,11 @@ Joining:
                                              parent, hop)
 ```
 
-- `node_enter_waiting_for_join_response(parent, parent_hop)` — stores selected parent; sets provisional child hop = parent_hop + 1  
-- `node_enter_registered(assigned, parent, hop)` — pushes short address via `set_local_address()`, then `REGISTERED`  
-- `node_revert_to_unregistered()` — clears parent/hop, optionally restores `UNASSIGNED_ADDRESS`, returns to `UNREGISTERED`
+- `node_enter_waiting_for_join_response(parent, parent_hop)` — after selection window  
+- `node_enter_registered(assigned, parent, hop)` — from `handle_join_response`  
+- `node_revert_to_unregistered()` — JOIN_RESPONSE timeout / registration abort  
 
-Those three are compiled and documented but not yet driven by JOIN message handlers.
+See `documentation/SECTION4_PROTOCOL_FLOW.md` for the full protocol wiring.
 
 ---
 
@@ -217,11 +217,10 @@ Addressing answers “what is my 16-bit ID?”. The FSM answers “what phase of
 
 ## 8. Still not done (later checklist sections)
 
-- Driving `WAITING_FOR_JOIN_RESPONSE` from parent selection  
-- JOIN_REQUEST / RESPONSE / ACKNOWLEDGE **TX** and handlers calling `node_enter_*` (decode handlers exist in §3)  
-- Periodic DATA only when `node_can_send_data()`  
-- Automatic revert on join timeout (helper exists; timer not wired)  
-- Multi-hop registered nodes answering probes (gate already allows any `REGISTERED` node)
+- Multi-hop JOIN via intermediate parents (JOIN_REQUEST currently goes directly to root)  
+- Hardware demo / Wireshark evidence  
+
+DATA when `node_can_send_data()` is implemented — see `SECTION4_PROTOCOL_FLOW.md` §6.
 
 ---
 

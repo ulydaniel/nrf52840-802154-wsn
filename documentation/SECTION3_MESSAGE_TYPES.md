@@ -28,10 +28,10 @@ Aligned with the assignment PDF (no remapping):
 |------|------:|---------|----------------|
 | `PROBE` | 1 | `handle_probe` | Registered node replies with HEARTBEAT |
 | `HEARTBEAT` | 2 | `handle_heartbeat` | Probing joiner accepts matching reply |
-| `JOIN_REQUEST` | 3 | `handle_join_request` | Decode + log; allocation TBD |
-| `JOIN_RESPONSE` | 4 | `handle_join_response` | Decode + log; registration TBD |
-| `JOIN_ACKNOWLEDGE` | 5 | `handle_join_acknowledge` | Decode + log; table activate TBD |
-| `DATA` | 6 | `handle_data` | Decode + log; forward / collect TBD |
+| `JOIN_REQUEST` | 3 | `handle_join_request` | Root allocates / retransmits (`SECTION4`) |
+| `JOIN_RESPONSE` | 4 | `handle_join_response` | Joiner registers + ACK (`SECTION4`) |
+| `JOIN_ACKNOWLEDGE` | 5 | `handle_join_acknowledge` | Root marks active (`SECTION4`) |
+| `DATA` | 6 | `handle_data` | 1 Hz TX / parent forward / root collect (`SECTION4`) |
 | `NETIDREQ` | 7 | `handle_netid_request` | Reserved (multi-net) |
 | `NETIDRESP` | 8 | `handle_netid_response` | Reserved (multi-net) |
 
@@ -90,7 +90,7 @@ struct oz_packet {
 |------|---------|-------------|---------------|-------------|------------|
 | PROBE | K (seconds) | usually unassigned | unused | unknown until joined | probe seq |
 | HEARTBEAT | probe RSSI (dBm) | responder parent | unused | responder hop | echoes PROBE seq |
-| JOIN_REQUEST | optional / unused | selected parent | unused | proposed child hop | request seq |
+| JOIN_REQUEST | join nonce | selected parent | unused | proposed child hop | request seq |
 | JOIN_RESPONSE | optional status | parent to install | **granted address** | child hop | response seq |
 | JOIN_ACKNOWLEDGE | unused | installed parent | accepted address | installed hop | ack seq |
 | DATA | sensor reading | sender parent (optional) | unused | sender hop | data seq |
@@ -177,11 +177,9 @@ Both boards in a demo must run this firmware revision; mixed v1/v2 peers will dr
 
 ## 8. Still not done (later checklist sections)
 
-- Building and transmitting JOIN_REQUEST / RESPONSE / ACKNOWLEDGE
-- Root address pool + duplicate detection on JOIN_REQUEST
-- Calling `node_enter_*` from join handlers
-- Periodic DATA generation and parent forwarding
 - Multi-network NETIDREQ / NETIDRESP behavior
+
+Join TX/RX, FSM registration, and DATA collection are documented in `SECTION4_PROTOCOL_FLOW.md`.
 
 ---
 

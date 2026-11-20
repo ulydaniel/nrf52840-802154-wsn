@@ -11,7 +11,7 @@
  * Application addresses are network:node (see MAKE_ADDRESS).
  * Only the root address is hard-coded. Joining nodes receive
  * addresses 1:1 .. 1:253 dynamically through the join protocol
- * (not yet implemented; see documentation/ASSIGNMENT_CHECKLIST.md).
+ * (see documentation/SECTION4_PROTOCOL_FLOW.md).
  *
  * Node FSM (assignment §5):
  *
@@ -20,23 +20,31 @@
  *      Root boots already REGISTERED at 1:254.
  *      Joining nodes boot UNREGISTERED, then enter PROBING.
  *
- * Transitional probe / heartbeat (join REQUEST/RESPONSE still pending):
+ * Protocol flow (assignment §4.1–4.6):
  *
- *      Joining (PROBING)  --PROBE broadcast-->  Root (REGISTERED)
- *      Joining (PROBING)  <-HEARTBEAT---------  Root (REGISTERED)
+ *      Joining (PROBING)  --PROBE broadcast-->  Registered node
+ *      Joining (PROBING)  <-HEARTBEAT---------  Registered node
+ *      Joining selects parent (lowest hop, then strongest RSSI,
+ *      then lowest address), then:
+ *      Joining (WAITING)  --JOIN_REQUEST----->  Root
+ *      Joining (WAITING)  <-JOIN_RESPONSE-----  Root (assigns 1:n)
+ *      Joining (REGISTERED)--JOIN_ACK-------->  Root (marks active)
  *
  *      Joining node: every K seconds a PROBE is broadcast.
- *      If no HEARTBEAT arrives before the next expiry, K grows
- *      by N. A matching HEARTBEAT resets K.
+ *      Heartbeats collected during a selection window drive
+ *      parent choice. Join response timeouts retransmit the
+ *      request or revert to UNREGISTERED / PROBING.
  *
  *      HEARTBEAT carries: probe RSSI, GUID, battery level
  *      and a heartbeat sequence number (see Message bodies).
  *
  *      Both roles decode received packets and dispatch them
  *      through a function-pointer table indexed by message type.
- *      Types 1–8 match the assignment; PROBE / HEARTBEAT drive
- *      discovery today. JOIN / DATA / NETID handlers decode and
- *      log; join allocation and DATA forwarding are later.
+ *
+ *      After REGISTERED, joining nodes send DATA every 1 s
+ *      (sequential sensor value) toward their parent. Intermediate
+ *      parents forward toward the root; the root reports missing
+ *      sequences per child source.
  *
  * Channel : 11
  * PAN ID  : 0x1234
@@ -207,6 +215,21 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define PROBE_K_MAX_SECONDS        30
 
 /*
+ * Parent selection + join timers (assignment §4.3–4.6).
+ *
+ * After the first eligible HEARTBEAT, the joining node waits
+ * PARENT_SELECTION_WINDOW_MS for additional replies, then picks
+ * a parent and sends JOIN_REQUEST toward the root.
+ */
+#define PARENT_SELECTION_WINDOW_MS       2000
+#define MAX_PARENT_CANDIDATES            8
+#define JOIN_RESPONSE_TIMEOUT_SECONDS    5
+#define JOIN_REQUEST_MAX_RETRIES         3
+#define JOIN_ACK_PENDING_TIMEOUT_SECONDS 10
+#define ADDRESS_TABLE_CAPACITY           16
+#define JOINING_LOOP_POLL_MS             100
+
+/*
  * Battery level is measured on the nRF52840 VDD rail with the
  * SAADC internal VDD input. This equals the battery voltage
  * only when the battery feeds VDD directly (coin cell, 2xAA);
@@ -250,6 +273,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  *                      hop      = responder's hop count to root
  *      JOIN_REQUEST    parent   = selected parent
  *                      hop      = proposed child hop (parent+1)
+ *                      value    = join nonce (concurrent-joiner id)
  *      JOIN_RESPONSE   assigned = address granted by root
  *                      parent   = parent the joiner should use
  *                      hop      = hop count for the new child
@@ -433,9 +457,9 @@ static uint16_t tx_sequence = 1;
 
 
 /*
- * Probe state. The joining node originates probes until the
- * join FSM takes over. Owned by the main thread, which also
- * runs the message handlers, so no locking is needed.
+ * Probe state. The joining node originates probes until parent
+ * selection starts JOIN_REQUEST. Owned by the main thread, which
+ * also runs the message handlers, so no locking is needed.
  */
 static unsigned int probe_k_seconds = PROBE_K_INITIAL_SECONDS;
 static uint16_t probe_outstanding_sequence;
@@ -443,6 +467,82 @@ static bool probe_outstanding;
 
 #if NODE_ROLE == ROLE_JOINING
 K_TIMER_DEFINE(probe_timer, NULL, NULL);
+K_TIMER_DEFINE(selection_timer, NULL, NULL);
+K_TIMER_DEFINE(join_timer, NULL, NULL);
+
+/*
+ * HEARTBEAT candidates collected during the selection window.
+ * rssi_dbm is how well we hear the responder (RX frame RSSI).
+ */
+struct parent_candidate {
+	uint16_t address;
+	uint16_t parent_id;
+	uint8_t hop_count;
+	int16_t rssi_dbm;
+	bool valid;
+};
+
+static struct parent_candidate parent_candidates[MAX_PARENT_CANDIDATES];
+static size_t parent_candidate_count;
+static bool selection_window_active;
+
+/* Outstanding JOIN_REQUEST while WAITING_FOR_JOIN_RESPONSE. */
+static uint16_t join_request_sequence;
+static uint16_t join_request_nonce;
+static uint8_t join_request_retries;
+static bool join_request_outstanding;
+static uint16_t selected_parent_address;
+static uint8_t selected_parent_hop;
+
+/*
+ * Post-registration DATA collection (§4.7).
+ * Sensor value is a sequential counter sent every TX_PERIOD_MS.
+ */
+K_TIMER_DEFINE(data_timer, NULL, NULL);
+static int16_t sensor_value = 1;
+static uint16_t data_tx_sequence = 1;
+static bool data_collection_active;
+#endif
+
+#if NODE_ROLE == ROLE_ROOT
+/*
+ * Root address-allocation table (assignment §5 / §4.5–4.6).
+ * Pending rows wait for JOIN_ACKNOWLEDGE; active rows are live.
+ *
+ * Joiners share IEEE short address 0xFFFE before registration, so
+ * duplicate detection keys on join_nonce (JOIN_REQUEST.value) rather
+ * than MAC alone.
+ */
+struct address_record {
+	uint16_t address;
+	uint16_t parent;
+	uint8_t hop_count;
+	uint16_t request_sequence;
+	uint16_t join_nonce;
+	uint16_t requester_mac;
+	bool pending;
+	bool active;
+	bool in_use;
+	int64_t pending_deadline_ms;
+};
+
+static struct address_record address_table[ADDRESS_TABLE_CAPACITY];
+
+/*
+ * Per-originator DATA collection stats on the root (§4.7).
+ * Keyed by the original child's source_id (preserved across forwards).
+ */
+struct data_collector_entry {
+	uint16_t source;
+	uint16_t last_sequence;
+	bool sequence_valid;
+	uint32_t received;
+	uint32_t lost;
+	int16_t last_value;
+	bool in_use;
+};
+
+static struct data_collector_entry data_collectors[ADDRESS_TABLE_CAPACITY];
 #endif
 
 
@@ -594,15 +694,16 @@ static int ieee802154_apply_short_address(uint16_t addr)
 	return 0;
 }
 
+#if NODE_ROLE == ROLE_JOINING
 /*
  * Install a new application address and mirror it to the radio.
  * Returns 0 on success. On L2 failure, local_address is left
  * unchanged.
  *
  * Called by node_enter_registered() / node_revert_to_unregistered()
- * once join assigns or revokes an address (Milestone 5).
+ * when join assigns or revokes an address.
  */
-static int __maybe_unused set_local_address(uint16_t addr)
+static int set_local_address(uint16_t addr)
 {
 	uint16_t previous = local_address;
 	int ret;
@@ -624,6 +725,7 @@ static int __maybe_unused set_local_address(uint16_t addr)
 
 	return 0;
 }
+#endif
 
 
 /* =========================================================
@@ -702,6 +804,49 @@ static bool node_can_reply_heartbeat(void)
 	return current_state == NODE_REGISTERED;
 }
 
+#if NODE_ROLE == ROLE_JOINING
+static void clear_parent_candidates(void)
+{
+	memset(parent_candidates, 0, sizeof(parent_candidates));
+	parent_candidate_count = 0;
+	selection_window_active = false;
+	k_timer_stop(&selection_timer);
+}
+
+static void clear_join_request_state(void)
+{
+	join_request_outstanding = false;
+	join_request_retries = 0;
+	join_request_sequence = 0;
+	join_request_nonce = 0;
+	selected_parent_address = UNASSIGNED_ADDRESS;
+	selected_parent_hop = HOP_COUNT_UNKNOWN;
+	k_timer_stop(&join_timer);
+}
+
+static void stop_data_collection(void)
+{
+	data_collection_active = false;
+	k_timer_stop(&data_timer);
+}
+
+static void start_data_collection(void)
+{
+	if (data_collection_active) {
+		return;
+	}
+
+	sensor_value = 1;
+	data_tx_sequence = 1;
+	data_collection_active = true;
+	k_timer_start(&data_timer, K_MSEC(TX_PERIOD_MS), K_NO_WAIT);
+
+	LOG_INF(
+		"DATA collection started (period=%u ms, value starts at 1)",
+		(unsigned int)TX_PERIOD_MS
+	);
+}
+
 /*
  * UNREGISTERED → PROBING. Clears any half-finished join context
  * and starts listening/sending discovery traffic.
@@ -714,6 +859,10 @@ static void node_enter_probing(void)
 	probe_outstanding_sequence = 0;
 	probe_k_seconds = PROBE_K_INITIAL_SECONDS;
 
+	clear_parent_candidates();
+	clear_join_request_state();
+	stop_data_collection();
+
 	set_node_state(NODE_PROBING);
 }
 
@@ -722,15 +871,19 @@ static void node_enter_probing(void)
  * address context, and return to UNREGISTERED. The caller may
  * immediately call node_enter_probing() to retry.
  */
-static void __maybe_unused node_revert_to_unregistered(void)
+static void node_revert_to_unregistered(void)
 {
 	parent_address = UNASSIGNED_ADDRESS;
 	hop_count = HOP_COUNT_UNKNOWN;
 	probe_outstanding = false;
 	probe_outstanding_sequence = 0;
 
-	if (!address_is_root(BOOT_ADDRESS) &&
-	    !address_is_unassigned(local_address)) {
+	clear_parent_candidates();
+	clear_join_request_state();
+	stop_data_collection();
+	k_timer_stop(&probe_timer);
+
+	if (!address_is_unassigned(local_address)) {
 		/*
 		 * A previously assigned joining node that lost its
 		 * place must fall back to the unassigned short
@@ -745,20 +898,25 @@ static void __maybe_unused node_revert_to_unregistered(void)
 
 /*
  * PROBING → WAITING_FOR_JOIN_RESPONSE after parent selection.
- * Join TX / timers land in a later milestone.
  */
-static void __maybe_unused node_enter_waiting_for_join_response(
+static void node_enter_waiting_for_join_response(
 	uint16_t selected_parent,
 	uint8_t parent_hop_count)
 {
 	parent_address = selected_parent;
 	/*
 	 * Child hop count will be parent_hop + 1 once the response
-	 * confirms membership; stash parent hop for now.
+	 * confirms membership; stash provisional hop for now.
 	 */
 	hop_count = (parent_hop_count == HOP_COUNT_UNKNOWN) ?
 		    HOP_COUNT_UNKNOWN :
 		    (uint8_t)(parent_hop_count + 1U);
+
+	selected_parent_address = selected_parent;
+	selected_parent_hop = parent_hop_count;
+	probe_outstanding = false;
+	k_timer_stop(&probe_timer);
+	clear_parent_candidates();
 
 	set_node_state(NODE_WAITING_FOR_JOIN_RESPONSE);
 }
@@ -767,7 +925,7 @@ static void __maybe_unused node_enter_waiting_for_join_response(
  * WAITING_FOR_JOIN_RESPONSE → REGISTERED after JOIN_RESPONSE
  * + local short-address update. JOIN_ACKNOWLEDGE is sent by the caller.
  */
-static void __maybe_unused node_enter_registered(
+static void node_enter_registered(
 	uint16_t assigned_address,
 	uint16_t assigned_parent,
 	uint8_t assigned_hop_count)
@@ -786,9 +944,16 @@ static void __maybe_unused node_enter_registered(
 
 	parent_address = assigned_parent;
 	hop_count = assigned_hop_count;
+
+	clear_join_request_state();
+	k_timer_stop(&probe_timer);
+
 	set_node_state(NODE_REGISTERED);
 	log_node_state("Registered");
+
+	start_data_collection();
 }
+#endif /* ROLE_JOINING */
 
 /*
  * Apply boot role to the FSM after the radio is up.
@@ -1524,7 +1689,7 @@ static __maybe_unused int create_packet_socket(void)
  * mac_destination is the IEEE 802.15.4 MAC destination.
  * ========================================================= */
 
-static __maybe_unused int send_oz_packet(
+static int send_oz_packet(
 	const struct oz_packet *packet,
 	uint16_t mac_destination)
 {
@@ -2048,6 +2213,717 @@ static void build_packet(
 }
 
 
+#if NODE_ROLE == ROLE_ROOT
+
+/* =========================================================
+ * Root address allocation table (§4.5 / §5)
+ * ========================================================= */
+
+static int address_table_find_by_nonce(uint16_t join_nonce)
+{
+	int i;
+
+	if (join_nonce == 0) {
+		return -1;
+	}
+
+	for (i = 0; i < ADDRESS_TABLE_CAPACITY; i++) {
+		if (address_table[i].in_use &&
+		    (address_table[i].join_nonce == join_nonce)) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static int address_table_find_by_assigned(uint16_t assigned)
+{
+	int i;
+
+	for (i = 0; i < ADDRESS_TABLE_CAPACITY; i++) {
+		if (address_table[i].in_use &&
+		    (address_table[i].address == assigned)) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static uint8_t address_table_parent_hop(uint16_t parent)
+{
+	int idx;
+
+	if (address_is_root(parent)) {
+		return 0;
+	}
+
+	idx = address_table_find_by_assigned(parent);
+	if ((idx >= 0) && address_table[idx].active) {
+		return address_table[idx].hop_count;
+	}
+
+	return HOP_COUNT_UNKNOWN;
+}
+
+static bool address_table_parent_ok(uint16_t parent)
+{
+	int idx;
+
+	if (address_is_root(parent)) {
+		return true;
+	}
+
+	idx = address_table_find_by_assigned(parent);
+	return (idx >= 0) && address_table[idx].active;
+}
+
+static int address_table_alloc_slot(void)
+{
+	int i;
+
+	for (i = 0; i < ADDRESS_TABLE_CAPACITY; i++) {
+		if (!address_table[i].in_use) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static bool address_table_address_taken(uint16_t addr)
+{
+	return address_table_find_by_assigned(addr) >= 0;
+}
+
+/*
+ * Allocate the lowest free assignable address 1:1 .. 1:253.
+ * Returns 0 on success.
+ */
+static int address_table_allocate(
+	uint16_t parent,
+	uint8_t child_hop,
+	uint16_t request_sequence,
+	uint16_t join_nonce,
+	uint16_t requester_mac,
+	struct address_record **out_record)
+{
+	int slot;
+	uint8_t node_id;
+	uint16_t candidate;
+
+	slot = address_table_alloc_slot();
+	if (slot < 0) {
+		LOG_ERR("Address table full (%d entries)", ADDRESS_TABLE_CAPACITY);
+		return -ENOMEM;
+	}
+
+	for (node_id = NODE_ID_FIRST_ASSIGNABLE;
+	     node_id <= NODE_ID_LAST_ASSIGNABLE;
+	     node_id++) {
+		candidate = MAKE_ADDRESS(NETWORK_ID_ROOT, node_id);
+		if (!address_table_address_taken(candidate)) {
+			break;
+		}
+	}
+
+	if (node_id > NODE_ID_LAST_ASSIGNABLE) {
+		LOG_ERR("Address pool exhausted (1:1 .. 1:253)");
+		return -ENOSPC;
+	}
+
+	memset(&address_table[slot], 0, sizeof(address_table[slot]));
+	address_table[slot].address = candidate;
+	address_table[slot].parent = parent;
+	address_table[slot].hop_count = child_hop;
+	address_table[slot].request_sequence = request_sequence;
+	address_table[slot].join_nonce = join_nonce;
+	address_table[slot].requester_mac = requester_mac;
+	address_table[slot].pending = true;
+	address_table[slot].active = false;
+	address_table[slot].in_use = true;
+	address_table[slot].pending_deadline_ms =
+		k_uptime_get() +
+		(JOIN_ACK_PENDING_TIMEOUT_SECONDS * 1000);
+
+	*out_record = &address_table[slot];
+
+	LOG_INF(
+		"Allocated pending %u:%u parent=%u:%u hop=%u nonce=%u mac=0x%04X seq=%u",
+		(unsigned int)ADDRESS_NETWORK(candidate),
+		(unsigned int)ADDRESS_NODE(candidate),
+		(unsigned int)ADDRESS_NETWORK(parent),
+		(unsigned int)ADDRESS_NODE(parent),
+		(unsigned int)child_hop,
+		(unsigned int)join_nonce,
+		(unsigned int)requester_mac,
+		(unsigned int)request_sequence
+	);
+
+	return 0;
+}
+
+static void address_table_release(int idx)
+{
+	if ((idx < 0) || (idx >= ADDRESS_TABLE_CAPACITY)) {
+		return;
+	}
+
+	LOG_INF(
+		"Released address %u:%u (pending=%d active=%d)",
+		(unsigned int)ADDRESS_NETWORK(address_table[idx].address),
+		(unsigned int)ADDRESS_NODE(address_table[idx].address),
+		(int)address_table[idx].pending,
+		(int)address_table[idx].active
+	);
+
+	memset(&address_table[idx], 0, sizeof(address_table[idx]));
+}
+
+static void address_table_check_timeouts(void)
+{
+	int64_t now = k_uptime_get();
+	int i;
+
+	for (i = 0; i < ADDRESS_TABLE_CAPACITY; i++) {
+		if (!address_table[i].in_use || !address_table[i].pending) {
+			continue;
+		}
+
+		if (now >= address_table[i].pending_deadline_ms) {
+			LOG_WRN(
+				"JOIN_ACK timeout for pending %u:%u; releasing",
+				(unsigned int)ADDRESS_NETWORK(
+					address_table[i].address),
+				(unsigned int)ADDRESS_NODE(
+					address_table[i].address)
+			);
+			address_table_release(i);
+		}
+	}
+}
+
+static int send_join_response_for_record(
+	const struct address_record *record,
+	uint16_t request_sequence,
+	uint16_t mac_destination)
+{
+	struct oz_packet response;
+	int ret;
+
+	build_packet(
+		&response,
+		MSG_TYPE_JOIN_RESPONSE,
+		UNASSIGNED_ADDRESS,
+		0,
+		request_sequence
+	);
+
+	response.parent_id = record->parent;
+	response.assigned_id = record->address;
+	response.hop_count = record->hop_count;
+
+	print_packet("JOIN_RESPONSE TX", &response);
+
+	ret = send_oz_packet(&response, mac_destination);
+	if (ret) {
+		LOG_ERR("JOIN_RESPONSE TX failed: %d", ret);
+	}
+
+	return ret;
+}
+
+#endif /* ROLE_ROOT */
+
+
+#if NODE_ROLE == ROLE_JOINING
+
+/* =========================================================
+ * Parent selection + JOIN_REQUEST (§4.3–4.4)
+ * ========================================================= */
+
+static void record_parent_candidate(
+	uint16_t address,
+	uint16_t parent_id,
+	uint8_t hop,
+	int16_t rssi_dbm)
+{
+	size_t i;
+
+	if (address_is_unassigned(address) ||
+	    address_is_broadcast(address)) {
+		return;
+	}
+
+	for (i = 0; i < parent_candidate_count; i++) {
+		if (parent_candidates[i].address == address) {
+			parent_candidates[i].parent_id = parent_id;
+			parent_candidates[i].hop_count = hop;
+			parent_candidates[i].rssi_dbm = rssi_dbm;
+			parent_candidates[i].valid = true;
+			return;
+		}
+	}
+
+	if (parent_candidate_count >= MAX_PARENT_CANDIDATES) {
+		LOG_WRN("Parent candidate table full; dropping %u:%u",
+			(unsigned int)ADDRESS_NETWORK(address),
+			(unsigned int)ADDRESS_NODE(address));
+		return;
+	}
+
+	parent_candidates[parent_candidate_count].address = address;
+	parent_candidates[parent_candidate_count].parent_id = parent_id;
+	parent_candidates[parent_candidate_count].hop_count = hop;
+	parent_candidates[parent_candidate_count].rssi_dbm = rssi_dbm;
+	parent_candidates[parent_candidate_count].valid = true;
+	parent_candidate_count++;
+}
+
+/*
+ * Return true if `a` is a better parent than `b`.
+ * Policy: lowest hop, then strongest RSSI, then lowest address.
+ */
+static bool parent_candidate_better(
+	const struct parent_candidate *a,
+	const struct parent_candidate *b)
+{
+	bool a_hop_known = (a->hop_count != HOP_COUNT_UNKNOWN);
+	bool b_hop_known = (b->hop_count != HOP_COUNT_UNKNOWN);
+
+	if (a_hop_known != b_hop_known) {
+		return a_hop_known;
+	}
+
+	if (a_hop_known && (a->hop_count != b->hop_count)) {
+		return a->hop_count < b->hop_count;
+	}
+
+	if ((a->rssi_dbm != IEEE802154_MAC_RSSI_DBM_UNDEFINED) &&
+	    (b->rssi_dbm != IEEE802154_MAC_RSSI_DBM_UNDEFINED) &&
+	    (a->rssi_dbm != b->rssi_dbm)) {
+		return a->rssi_dbm > b->rssi_dbm;
+	}
+
+	if ((a->rssi_dbm != IEEE802154_MAC_RSSI_DBM_UNDEFINED) !=
+	    (b->rssi_dbm != IEEE802154_MAC_RSSI_DBM_UNDEFINED)) {
+		return a->rssi_dbm != IEEE802154_MAC_RSSI_DBM_UNDEFINED;
+	}
+
+	return a->address < b->address;
+}
+
+static int select_best_parent(struct parent_candidate *out)
+{
+	size_t i;
+	int best = -1;
+
+	for (i = 0; i < parent_candidate_count; i++) {
+		if (!parent_candidates[i].valid) {
+			continue;
+		}
+
+		if ((best < 0) ||
+		    parent_candidate_better(
+			    &parent_candidates[i],
+			    &parent_candidates[best])) {
+			best = (int)i;
+		}
+	}
+
+	if (best < 0) {
+		return -ENOENT;
+	}
+
+	*out = parent_candidates[best];
+	return 0;
+}
+
+static int send_join_request(void)
+{
+	struct oz_packet request;
+	int ret;
+
+	build_packet(
+		&request,
+		MSG_TYPE_JOIN_REQUEST,
+		ROOT_ADDRESS,
+		(int16_t)join_request_nonce,
+		join_request_sequence
+	);
+
+	request.parent_id = selected_parent_address;
+	request.assigned_id = UNASSIGNED_ADDRESS;
+	request.hop_count = (selected_parent_hop == HOP_COUNT_UNKNOWN) ?
+			    HOP_COUNT_UNKNOWN :
+			    (uint8_t)(selected_parent_hop + 1U);
+
+	print_packet("JOIN_REQUEST TX", &request);
+
+	ret = send_oz_packet(&request, ROOT_ADDRESS);
+	if (ret) {
+		LOG_ERR("JOIN_REQUEST TX failed: %d", ret);
+		return ret;
+	}
+
+	join_request_outstanding = true;
+	k_timer_start(
+		&join_timer,
+		K_SECONDS(JOIN_RESPONSE_TIMEOUT_SECONDS),
+		K_NO_WAIT
+	);
+
+	LOG_INF(
+		"JOIN_REQUEST seq=%u nonce=%u parent=%u:%u hop=%u (retry %u/%u)",
+		(unsigned int)join_request_sequence,
+		(unsigned int)join_request_nonce,
+		(unsigned int)ADDRESS_NETWORK(selected_parent_address),
+		(unsigned int)ADDRESS_NODE(selected_parent_address),
+		(unsigned int)request.hop_count,
+		(unsigned int)join_request_retries,
+		(unsigned int)JOIN_REQUEST_MAX_RETRIES
+	);
+
+	return 0;
+}
+
+static void start_join_with_parent(const struct parent_candidate *chosen)
+{
+	LOG_INF(
+		"Parent selected %u:%u hop=%u rssi=%d (policy: hop, RSSI, addr)",
+		(unsigned int)ADDRESS_NETWORK(chosen->address),
+		(unsigned int)ADDRESS_NODE(chosen->address),
+		(unsigned int)chosen->hop_count,
+		(int)chosen->rssi_dbm
+	);
+
+	node_enter_waiting_for_join_response(
+		chosen->address,
+		chosen->hop_count
+	);
+
+	join_request_sequence = tx_sequence++;
+	/*
+	 * Non-zero nonce distinguishes concurrent joiners that still
+	 * share the unassigned short address 0xFFFE.
+	 */
+	join_request_nonce = (uint16_t)(k_cycle_get_32() ^
+					(k_uptime_get_32() << 1) ^
+					tx_sequence);
+	if (join_request_nonce == 0) {
+		join_request_nonce = 1;
+	}
+	join_request_retries = 0;
+
+	if (send_join_request()) {
+		LOG_ERR("Initial JOIN_REQUEST failed; reverting to PROBING");
+		node_revert_to_unregistered();
+		node_enter_probing();
+		k_timer_start(
+			&probe_timer,
+			K_SECONDS(probe_k_seconds),
+			K_NO_WAIT
+		);
+	}
+}
+
+static void parent_selection_window_expired(void)
+{
+	struct parent_candidate chosen;
+
+	selection_window_active = false;
+
+	if (current_state != NODE_PROBING) {
+		return;
+	}
+
+	if (select_best_parent(&chosen)) {
+		LOG_WRN("Selection window ended with no candidates");
+		return;
+	}
+
+	start_join_with_parent(&chosen);
+}
+
+static void join_response_timeout(void)
+{
+	if (current_state != NODE_WAITING_FOR_JOIN_RESPONSE) {
+		return;
+	}
+
+	join_request_retries++;
+
+	if (join_request_retries > JOIN_REQUEST_MAX_RETRIES) {
+		LOG_WRN(
+			"JOIN_RESPONSE timeout after %u retries; revert to PROBING",
+			(unsigned int)JOIN_REQUEST_MAX_RETRIES
+		);
+		node_revert_to_unregistered();
+		node_enter_probing();
+		k_timer_start(
+			&probe_timer,
+			K_SECONDS(probe_k_seconds),
+			K_NO_WAIT
+		);
+		return;
+	}
+
+	LOG_WRN(
+		"JOIN_RESPONSE timeout; retransmitting JOIN_REQUEST (%u/%u)",
+		(unsigned int)join_request_retries,
+		(unsigned int)JOIN_REQUEST_MAX_RETRIES
+	);
+
+	(void)send_join_request();
+}
+
+static int send_join_acknowledge(
+	uint16_t assigned,
+	uint16_t parent,
+	uint8_t hop,
+	uint16_t sequence)
+{
+	struct oz_packet ack;
+	int ret;
+
+	build_packet(
+		&ack,
+		MSG_TYPE_JOIN_ACKNOWLEDGE,
+		ROOT_ADDRESS,
+		0,
+		sequence
+	);
+
+	ack.parent_id = parent;
+	ack.assigned_id = assigned;
+	ack.hop_count = hop;
+
+	print_packet("JOIN_ACKNOWLEDGE TX", &ack);
+
+	ret = send_oz_packet(&ack, ROOT_ADDRESS);
+	if (ret) {
+		LOG_ERR("JOIN_ACKNOWLEDGE TX failed: %d", ret);
+	}
+
+	return ret;
+}
+
+/*
+ * DATA TX toward parent (§4.7). Source stays this node's
+ * assigned address; destination / MAC are the parent so
+ * intermediate nodes can forward hop-by-hop to the root.
+ */
+static int send_sensor_data(void)
+{
+	struct oz_packet data;
+	int ret;
+
+	if (!node_can_send_data()) {
+		return -EPERM;
+	}
+
+	if (address_is_unassigned(parent_address) ||
+	    address_is_broadcast(parent_address)) {
+		LOG_ERR("DATA aborted: parent not set");
+		return -EINVAL;
+	}
+
+	build_packet(
+		&data,
+		MSG_TYPE_DATA,
+		parent_address,
+		sensor_value,
+		data_tx_sequence
+	);
+
+	data.parent_id = parent_address;
+	data.assigned_id = UNASSIGNED_ADDRESS;
+	data.hop_count = hop_count;
+
+	print_packet("DATA TX", &data);
+
+	ret = send_oz_packet(&data, parent_address);
+	if (ret) {
+		LOG_ERR("DATA TX failed: %d", ret);
+		return ret;
+	}
+
+	LOG_INF(
+		"DATA seq=%u value=%d -> parent %u:%u",
+		(unsigned int)data.sequence,
+		(int)data.value,
+		(unsigned int)ADDRESS_NETWORK(parent_address),
+		(unsigned int)ADDRESS_NODE(parent_address)
+	);
+
+	sensor_value++;
+	data_tx_sequence++;
+
+	return 0;
+}
+
+static void data_timer_expired(void)
+{
+	if (!node_can_send_data()) {
+		stop_data_collection();
+		return;
+	}
+
+	(void)send_sensor_data();
+	k_timer_start(&data_timer, K_MSEC(TX_PERIOD_MS), K_NO_WAIT);
+}
+
+/*
+ * Forward a child's DATA one hop toward the root. Preserves the
+ * original source_id / sequence / value so the root can attribute
+ * the reading and detect gaps.
+ */
+static int forward_data_to_parent(const struct oz_packet *packet)
+{
+	struct oz_packet forward;
+	int ret;
+
+	if (!node_can_send_data()) {
+		return -EPERM;
+	}
+
+	if (address_is_unassigned(parent_address) ||
+	    address_is_broadcast(parent_address)) {
+		LOG_ERR("DATA forward aborted: parent not set");
+		return -EINVAL;
+	}
+
+	if (packet->source_id == local_address) {
+		return 0;
+	}
+
+	forward = *packet;
+	forward.destination_id = parent_address;
+	forward.parent_id = parent_address;
+	forward.hop_count = hop_count;
+
+	print_packet("DATA FWD", &forward);
+
+	ret = send_oz_packet(&forward, parent_address);
+	if (ret) {
+		LOG_ERR("DATA forward failed: %d", ret);
+		return ret;
+	}
+
+	LOG_INF(
+		"DATA forwarded origin=%u:%u seq=%u value=%d -> %u:%u",
+		(unsigned int)ADDRESS_NETWORK(packet->source_id),
+		(unsigned int)ADDRESS_NODE(packet->source_id),
+		(unsigned int)packet->sequence,
+		(int)packet->value,
+		(unsigned int)ADDRESS_NETWORK(parent_address),
+		(unsigned int)ADDRESS_NODE(parent_address)
+	);
+
+	return 0;
+}
+
+#endif /* ROLE_JOINING */
+
+
+static uint32_t track_sequence_gap(
+	uint16_t sequence,
+	uint16_t *last_sequence,
+	bool *valid);
+
+#if NODE_ROLE == ROLE_ROOT
+
+static int data_collector_find(uint16_t source)
+{
+	int i;
+
+	for (i = 0; i < ADDRESS_TABLE_CAPACITY; i++) {
+		if (data_collectors[i].in_use &&
+		    (data_collectors[i].source == source)) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static int data_collector_alloc(uint16_t source)
+{
+	int i;
+
+	for (i = 0; i < ADDRESS_TABLE_CAPACITY; i++) {
+		if (!data_collectors[i].in_use) {
+			memset(&data_collectors[i], 0, sizeof(data_collectors[i]));
+			data_collectors[i].source = source;
+			data_collectors[i].in_use = true;
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+/*
+ * Record one DATA sample at the root and log any sequence gaps
+ * for that originator since the previous sample.
+ */
+static void root_collect_data(const struct oz_packet *packet)
+{
+	int idx;
+	uint32_t gap;
+
+	idx = data_collector_find(packet->source_id);
+	if (idx < 0) {
+		idx = data_collector_alloc(packet->source_id);
+		if (idx < 0) {
+			LOG_ERR("DATA collector table full; dropping sample");
+			return;
+		}
+
+		LOG_INF(
+			"DATA collector started for %u:%u",
+			(unsigned int)ADDRESS_NETWORK(packet->source_id),
+			(unsigned int)ADDRESS_NODE(packet->source_id)
+		);
+	}
+
+	gap = track_sequence_gap(
+		packet->sequence,
+		&data_collectors[idx].last_sequence,
+		&data_collectors[idx].sequence_valid
+	);
+
+	data_collectors[idx].received++;
+	data_collectors[idx].lost += gap;
+	data_collectors[idx].last_value = packet->value;
+
+	if (gap > 0) {
+		LOG_WRN(
+			"DATA missing from %u:%u: %u packet(s) before seq=%u (total lost=%u / rx=%u)",
+			(unsigned int)ADDRESS_NETWORK(packet->source_id),
+			(unsigned int)ADDRESS_NODE(packet->source_id),
+			(unsigned int)gap,
+			(unsigned int)packet->sequence,
+			(unsigned int)data_collectors[idx].lost,
+			(unsigned int)data_collectors[idx].received
+		);
+	}
+
+	LOG_INF(
+		"DATA collected origin=%u:%u seq=%u value=%d (lost=%u / rx=%u)",
+		(unsigned int)ADDRESS_NETWORK(packet->source_id),
+		(unsigned int)ADDRESS_NODE(packet->source_id),
+		(unsigned int)packet->sequence,
+		(int)packet->value,
+		(unsigned int)data_collectors[idx].lost,
+		(unsigned int)data_collectors[idx].received
+	);
+}
+
+#endif /* ROLE_ROOT */
+
+
 /* =========================================================
  * Message handlers
  *
@@ -2292,9 +3168,10 @@ static void handle_probe(
 
 
 /*
- * HEARTBEAT: confirms the outstanding probe. A heartbeat whose
- * sequence does not match answers an older probe and is
- * ignored, so a late reply cannot cancel a newer miss.
+ * HEARTBEAT: while PROBING, record the responder as a parent
+ * candidate. The first accepted reply starts the selection window;
+ * when it expires the best candidate (hop, then RSSI, then address)
+ * receives a JOIN_REQUEST.
  */
 static void handle_heartbeat(
 	const struct oz_packet *packet,
@@ -2302,10 +3179,6 @@ static void handle_heartbeat(
 {
 	struct heartbeat_body body;
 
-	/*
-	 * Until parent selection + JOIN land, heartbeats only matter
-	 * while PROBING. Later, REGISTERED nodes may also track them.
-	 */
 	if (current_state != NODE_PROBING) {
 		LOG_INF(
 			"HEARTBEAT seq=%u ignored (state=%s; expected PROBING)",
@@ -2338,8 +3211,17 @@ static void handle_heartbeat(
 		&heartbeat_rx_sequence_valid
 	);
 
-	if ((!probe_outstanding) ||
-	    (packet->sequence != probe_outstanding_sequence)) {
+#if NODE_ROLE == ROLE_JOINING
+	/*
+	 * Accept matching replies for the outstanding probe, and also
+	 * additional replies while the selection window is already open
+	 * (other registered nodes answering the same / later probe).
+	 */
+	if (probe_outstanding &&
+	    (packet->sequence == probe_outstanding_sequence)) {
+		probe_outstanding = false;
+		probe_k_seconds = PROBE_K_INITIAL_SECONDS;
+	} else if (!selection_window_active) {
 		link_stats.heartbeats_stale++;
 		LOG_WRN(
 			"Stale/unsolicited HEARTBEAT seq=%u from 0x%04X ignored",
@@ -2349,73 +3231,84 @@ static void handle_heartbeat(
 		return;
 	}
 
-	probe_outstanding = false;
-	probe_k_seconds = PROBE_K_INITIAL_SECONDS;
-
-	/*
-	if (packet->value == IEEE802154_MAC_RSSI_DBM_UNDEFINED) {
-		LOG_INF(
-			"HEARTBEAT seq=%u from 0x%04X, probe RSSI unavailable",
-			(unsigned int)packet->sequence,
-			(unsigned int)packet->source_id
-		);
-	} else {
-		LOG_INF(
-			"HEARTBEAT seq=%u from 0x%04X, probe RSSI = %d dBm",
-			(unsigned int)packet->sequence,
-			(unsigned int)packet->source_id,
-			(int)packet->value
-		);
-	}
-	*/
-
 	LOG_INF(
-		"HEARTBEAT seq=%u from %u:%u accepted (parent=%u:%u hop=%u)",
+		"HEARTBEAT seq=%u from %u:%u accepted (parent=%u:%u hop=%u rssi=%d)",
 		(unsigned int)packet->sequence,
 		(unsigned int)ADDRESS_NETWORK(packet->source_id),
 		(unsigned int)ADDRESS_NODE(packet->source_id),
 		(unsigned int)ADDRESS_NETWORK(packet->parent_id),
 		(unsigned int)ADDRESS_NODE(packet->parent_id),
-		(unsigned int)packet->hop_count
+		(unsigned int)packet->hop_count,
+		(int)frame->rssi_dbm
 	);
 
 	print_packet("HEARTBEAT RX", packet);
 	print_heartbeat_body("HEARTBEAT RX BODY", &body, packet->value);
 
-	LOG_INF("K reset to %u s", probe_k_seconds);
+	record_parent_candidate(
+		packet->source_id,
+		packet->parent_id,
+		packet->hop_count,
+		frame->rssi_dbm
+	);
+
+	if (!selection_window_active) {
+		selection_window_active = true;
+		k_timer_start(
+			&selection_timer,
+			K_MSEC(PARENT_SELECTION_WINDOW_MS),
+			K_NO_WAIT
+		);
+		LOG_INF(
+			"Parent selection window open for %u ms",
+			(unsigned int)PARENT_SELECTION_WINDOW_MS
+		);
+	}
 
 	link_stats.heartbeats_accepted++;
 	print_link_stats();
+#else
+	ARG_UNUSED(frame);
+	link_stats.heartbeats_stale++;
+	LOG_INF("HEARTBEAT ignored on non-joining role");
+#endif
 }
 
 
 /*
- * JOIN_REQUEST: joining node asks the selected parent / root
- * for an address. Allocation + JOIN_RESPONSE TX land in the
- * join-protocol milestone; Section 3 only decodes and logs.
+ * JOIN_REQUEST: root validates, allocates (or finds pending),
+ * and transmits JOIN_RESPONSE. Duplicate requests from the same
+ * MAC retransmit the original assignment — never a second address.
  */
 static void handle_join_request(
 	const struct oz_packet *packet,
 	const struct received_frame *frame)
 {
-	ARG_UNUSED(frame);
-
 	print_packet("JOIN_REQUEST RX", packet);
 
 	LOG_INF(
-		"JOIN_REQUEST seq=%u from %u:%u parent=%u:%u hop=%u",
+		"JOIN_REQUEST seq=%u from %u:%u parent=%u:%u hop=%u mac=0x%04X",
 		(unsigned int)packet->sequence,
 		(unsigned int)ADDRESS_NETWORK(packet->source_id),
 		(unsigned int)ADDRESS_NODE(packet->source_id),
 		(unsigned int)ADDRESS_NETWORK(packet->parent_id),
 		(unsigned int)ADDRESS_NODE(packet->parent_id),
-		(unsigned int)packet->hop_count
+		(unsigned int)packet->hop_count,
+		(unsigned int)frame->mac_source
 	);
+
+#if NODE_ROLE == ROLE_ROOT
+	struct address_record *record = NULL;
+	uint16_t join_nonce = (uint16_t)packet->value;
+	uint8_t parent_hop;
+	uint8_t child_hop;
+	int idx;
+	int ret;
 
 	if (!address_is_root(local_address) ||
 	    (current_state != NODE_REGISTERED)) {
 		LOG_INF(
-			"JOIN_REQUEST ignored (local=%u:%u state=%s; root REGISTERED handles allocation)",
+			"JOIN_REQUEST ignored (local=%u:%u state=%s)",
 			(unsigned int)ADDRESS_NETWORK(local_address),
 			(unsigned int)ADDRESS_NODE(local_address),
 			node_state_name(current_state)
@@ -2423,15 +3316,83 @@ static void handle_join_request(
 		return;
 	}
 
-	LOG_INF(
-		"JOIN_REQUEST accepted for decode; address allocation not yet implemented"
+	if (join_nonce == 0) {
+		LOG_WRN("JOIN_REQUEST rejected: join nonce is zero");
+		return;
+	}
+
+	if (!address_table_parent_ok(packet->parent_id)) {
+		LOG_WRN(
+			"JOIN_REQUEST rejected: parent %u:%u not root/active",
+			(unsigned int)ADDRESS_NETWORK(packet->parent_id),
+			(unsigned int)ADDRESS_NODE(packet->parent_id)
+		);
+		return;
+	}
+
+	idx = address_table_find_by_nonce(join_nonce);
+	if (idx >= 0) {
+		record = &address_table[idx];
+		record->request_sequence = packet->sequence;
+		record->requester_mac = frame->mac_source;
+
+		if (record->pending) {
+			record->pending_deadline_ms =
+				k_uptime_get() +
+				(JOIN_ACK_PENDING_TIMEOUT_SECONDS * 1000);
+		}
+
+		LOG_INF(
+			"Duplicate JOIN_REQUEST nonce=%u; retransmit %u:%u",
+			(unsigned int)join_nonce,
+			(unsigned int)ADDRESS_NETWORK(record->address),
+			(unsigned int)ADDRESS_NODE(record->address)
+		);
+
+		(void)send_join_response_for_record(
+			record,
+			packet->sequence,
+			frame->mac_source
+		);
+		return;
+	}
+
+	parent_hop = address_table_parent_hop(packet->parent_id);
+	if (parent_hop == HOP_COUNT_UNKNOWN) {
+		LOG_WRN("JOIN_REQUEST rejected: parent hop unknown");
+		return;
+	}
+
+	child_hop = (uint8_t)(parent_hop + 1U);
+
+	ret = address_table_allocate(
+		packet->parent_id,
+		child_hop,
+		packet->sequence,
+		join_nonce,
+		frame->mac_source,
+		&record
 	);
+	if (ret) {
+		LOG_ERR("JOIN_REQUEST failed: cannot allocate (%d)", ret);
+		return;
+	}
+
+	(void)send_join_response_for_record(
+		record,
+		packet->sequence,
+		frame->mac_source
+	);
+#else
+	ARG_UNUSED(frame);
+	LOG_INF("JOIN_REQUEST ignored (not root)");
+#endif
 }
 
 
 /*
- * JOIN_RESPONSE: root grants assigned address + parent + hop.
- * Applying set_local_address() / JOIN_ACKNOWLEDGE is Milestone 5.
+ * JOIN_RESPONSE: joiner installs the assigned address, enters
+ * REGISTERED, and confirms with JOIN_ACKNOWLEDGE.
  */
 static void handle_join_response(
 	const struct oz_packet *packet,
@@ -2451,31 +3412,78 @@ static void handle_join_response(
 		(unsigned int)packet->hop_count
 	);
 
-	if ((current_state != NODE_PROBING) &&
-	    (current_state != NODE_WAITING_FOR_JOIN_RESPONSE)) {
+#if NODE_ROLE == ROLE_JOINING
+	if (current_state != NODE_WAITING_FOR_JOIN_RESPONSE) {
 		LOG_INF(
-			"JOIN_RESPONSE ignored (state=%s; expected PROBING or WAITING_FOR_JOIN_RESPONSE)",
+			"JOIN_RESPONSE ignored (state=%s; expected WAITING_FOR_JOIN_RESPONSE)",
 			node_state_name(current_state)
 		);
 		return;
 	}
 
-	LOG_INF(
-		"JOIN_RESPONSE accepted for decode; registration / JOIN_ACKNOWLEDGE not yet implemented"
+	if (!join_request_outstanding ||
+	    (packet->sequence != join_request_sequence)) {
+		LOG_WRN(
+			"JOIN_RESPONSE seq=%u ignored (expected seq=%u)",
+			(unsigned int)packet->sequence,
+			(unsigned int)join_request_sequence
+		);
+		return;
+	}
+
+	if (!address_is_assignable(packet->assigned_id)) {
+		LOG_ERR(
+			"JOIN_RESPONSE has invalid assigned address 0x%04X",
+			(unsigned int)packet->assigned_id
+		);
+		return;
+	}
+
+	node_enter_registered(
+		packet->assigned_id,
+		packet->parent_id,
+		packet->hop_count
 	);
+
+	if (current_state != NODE_REGISTERED) {
+		LOG_ERR("Registration failed; returning to PROBING");
+		node_enter_probing();
+		k_timer_start(
+			&probe_timer,
+			K_SECONDS(probe_k_seconds),
+			K_NO_WAIT
+		);
+		return;
+	}
+
+	(void)send_join_acknowledge(
+		packet->assigned_id,
+		packet->parent_id,
+		packet->hop_count,
+		packet->sequence
+	);
+
+	LOG_INF(
+		"Node REGISTERED at %u:%u parent=%u:%u hop=%u",
+		(unsigned int)ADDRESS_NETWORK(local_address),
+		(unsigned int)ADDRESS_NODE(local_address),
+		(unsigned int)ADDRESS_NETWORK(parent_address),
+		(unsigned int)ADDRESS_NODE(parent_address),
+		(unsigned int)hop_count
+	);
+#else
+	LOG_INF("JOIN_RESPONSE ignored (not joining)");
+#endif
 }
 
 
 /*
- * JOIN_ACKNOWLEDGE: joiner confirms the assigned address.
- * Root-side table activation is Milestone 5.
+ * JOIN_ACKNOWLEDGE: root marks the pending allocation active.
  */
 static void handle_join_acknowledge(
 	const struct oz_packet *packet,
 	const struct received_frame *frame)
 {
-	ARG_UNUSED(frame);
-
 	print_packet("JOIN_ACKNOWLEDGE RX", packet);
 
 	LOG_INF(
@@ -2488,6 +3496,9 @@ static void handle_join_acknowledge(
 		(unsigned int)packet->hop_count
 	);
 
+#if NODE_ROLE == ROLE_ROOT
+	int idx;
+
 	if (!address_is_root(local_address) ||
 	    (current_state != NODE_REGISTERED)) {
 		LOG_INF(
@@ -2499,15 +3510,41 @@ static void handle_join_acknowledge(
 		return;
 	}
 
+	idx = address_table_find_by_assigned(packet->assigned_id);
+	if (idx < 0) {
+		LOG_WRN(
+			"JOIN_ACKNOWLEDGE for unknown address %u:%u",
+			(unsigned int)ADDRESS_NETWORK(packet->assigned_id),
+			(unsigned int)ADDRESS_NODE(packet->assigned_id)
+		);
+		return;
+	}
+
+	address_table[idx].pending = false;
+	address_table[idx].active = true;
+	address_table[idx].requester_mac = frame->mac_source;
+	address_table[idx].parent = packet->parent_id;
+	address_table[idx].hop_count = packet->hop_count;
+
 	LOG_INF(
-		"JOIN_ACKNOWLEDGE accepted for decode; address-table activate not yet implemented"
+		"Address %u:%u marked ACTIVE (parent=%u:%u hop=%u)",
+		(unsigned int)ADDRESS_NETWORK(address_table[idx].address),
+		(unsigned int)ADDRESS_NODE(address_table[idx].address),
+		(unsigned int)ADDRESS_NETWORK(address_table[idx].parent),
+		(unsigned int)ADDRESS_NODE(address_table[idx].parent),
+		(unsigned int)address_table[idx].hop_count
 	);
+#else
+	ARG_UNUSED(frame);
+	LOG_INF("JOIN_ACKNOWLEDGE ignored (not root)");
+#endif
 }
 
 
 /*
- * DATA: sensor traffic toward the root. Generation and
- * parent forwarding are Milestone 6; Section 3 only logs.
+ * DATA: sensor traffic toward the root (§4.7).
+ * Root collects and reports sequence gaps. Registered non-root
+ * parents forward hop-by-hop, preserving the originator source_id.
  */
 static void handle_data(
 	const struct oz_packet *packet,
@@ -2526,7 +3563,20 @@ static void handle_data(
 		(unsigned int)packet->hop_count
 	);
 
-	if (!node_can_send_data() && !address_is_root(local_address)) {
+#if NODE_ROLE == ROLE_ROOT
+	if (!address_is_root(local_address) ||
+	    (current_state != NODE_REGISTERED)) {
+		LOG_INF(
+			"DATA ignored at non-collecting node (state=%s)",
+			node_state_name(current_state)
+		);
+		return;
+	}
+
+	root_collect_data(packet);
+	return;
+#elif NODE_ROLE == ROLE_JOINING
+	if (!node_can_send_data()) {
 		LOG_INF(
 			"DATA ignored (state=%s; only REGISTERED nodes forward)",
 			node_state_name(current_state)
@@ -2534,18 +3584,25 @@ static void handle_data(
 		return;
 	}
 
-	if (address_is_root(local_address)) {
+	/*
+	 * Accept DATA addressed to this node (child → parent hop).
+	 * Re-address toward our parent while keeping origin fields.
+	 */
+	if (packet->destination_id != local_address) {
 		LOG_INF(
-			"DATA at root; collection / missing-seq reporting not yet implemented"
+			"DATA ignored: dest=%u:%u local=%u:%u",
+			(unsigned int)ADDRESS_NETWORK(packet->destination_id),
+			(unsigned int)ADDRESS_NODE(packet->destination_id),
+			(unsigned int)ADDRESS_NETWORK(local_address),
+			(unsigned int)ADDRESS_NODE(local_address)
 		);
 		return;
 	}
 
-	LOG_INF(
-		"DATA forward candidate toward parent %u:%u; forwarding not yet implemented",
-		(unsigned int)ADDRESS_NETWORK(parent_address),
-		(unsigned int)ADDRESS_NODE(parent_address)
-	);
+	(void)forward_data_to_parent(packet);
+#else
+	ARG_UNUSED(packet);
+#endif
 }
 
 
@@ -2710,11 +3767,12 @@ static void process_frame(const struct received_frame *frame)
 
 
 /* =========================================================
- * Joining node (transitional probe timer)
+ * Joining node loop (§4.1–4.7)
  *
- * Until the join FSM is implemented, the joining board still
- * drives PROBE / HEARTBEAT discovery. Probes use the unassigned
- * source address and a broadcast destination (assignment §7.1).
+ * PROBING: broadcast PROBE, collect HEARTBEATs, select parent.
+ * WAITING_FOR_JOIN_RESPONSE: JOIN_REQUEST / timeout / retry.
+ * REGISTERED: 1 Hz DATA toward parent + forward child DATA;
+ *             also answers probes as a registered node.
  * ========================================================= */
 
 #if NODE_ROLE == ROLE_JOINING
@@ -2733,6 +3791,16 @@ static void probe_timer_expired(void)
 		LOG_INF(
 			"Probe timer ignored (state=%s)",
 			node_state_name(current_state)
+		);
+		return;
+	}
+
+	/* Do not emit a new probe once parent selection is underway. */
+	if (selection_window_active) {
+		k_timer_start(
+			&probe_timer,
+			K_SECONDS(probe_k_seconds),
+			K_NO_WAIT
 		);
 		return;
 	}
@@ -2762,6 +3830,11 @@ static void probe_timer_expired(void)
 		tx_sequence++
 	);
 
+	/* Explicit assignment fields for an unregistered probe. */
+	probe.parent_id = UNASSIGNED_ADDRESS;
+	probe.assigned_id = UNASSIGNED_ADDRESS;
+	probe.hop_count = HOP_COUNT_UNKNOWN;
+
 	print_packet("PROBE TX", &probe);
 
 	ret = send_oz_packet(&probe, BROADCAST_ADDRESS);
@@ -2783,10 +3856,9 @@ static void probe_timer_expired(void)
 static void run_probe_sender(void)
 {
 	struct received_frame frame;
-	k_ticks_t remaining;
 	int ret;
 
-	LOG_INF("Probe sender started (joining)");
+	LOG_INF("Joining node started (PROBE → JOIN → REGISTERED → DATA)");
 	log_node_state("Joining loop");
 	LOG_INF(
 		"Local       = %u:%u (0x%04X)",
@@ -2795,34 +3867,50 @@ static void run_probe_sender(void)
 		(unsigned int)local_address
 	);
 	LOG_INF(
-		"Destination = %u:%u (0x%04X broadcast)",
+		"PROBE dest  = %u:%u (0x%04X broadcast)",
 		(unsigned int)ADDRESS_NETWORK(BROADCAST_ADDRESS),
 		(unsigned int)ADDRESS_NODE(BROADCAST_ADDRESS),
 		(unsigned int)BROADCAST_ADDRESS
 	);
 	LOG_INF(
-		"K = %u s, N = %u s, K max = %u s",
+		"K = %u s, N = %u s, K max = %u s, select window = %u ms",
 		PROBE_K_INITIAL_SECONDS,
 		PROBE_N_INCREMENT_SECONDS,
-		PROBE_K_MAX_SECONDS
+		PROBE_K_MAX_SECONDS,
+		(unsigned int)PARENT_SELECTION_WINDOW_MS
 	);
+	LOG_INF("DATA period = %u ms after REGISTERED", (unsigned int)TX_PERIOD_MS);
 
 	k_timer_start(&probe_timer, K_SECONDS(probe_k_seconds), K_NO_WAIT);
 
 	while (1) {
-
-		/* k_timer_status_get() also clears the expiry count. */
-		if (k_timer_status_get(&probe_timer) > 0) {
-			probe_timer_expired();
-			continue;
-		}
-
-		/* Wait for a frame, but no longer than K has left. */
-		remaining = k_timer_remaining_ticks(&probe_timer);
-
-		ret = k_msgq_get(&receive_queue, &frame, K_TICKS(remaining));
+		ret = k_msgq_get(
+			&receive_queue,
+			&frame,
+			K_MSEC(JOINING_LOOP_POLL_MS)
+		);
 		if (ret == 0) {
 			process_frame(&frame);
+		}
+
+		if (current_state == NODE_PROBING) {
+			if (k_timer_status_get(&probe_timer) > 0) {
+				probe_timer_expired();
+			}
+
+			if (selection_window_active &&
+			    (k_timer_status_get(&selection_timer) > 0)) {
+				parent_selection_window_expired();
+			}
+		} else if (current_state == NODE_WAITING_FOR_JOIN_RESPONSE) {
+			if (k_timer_status_get(&join_timer) > 0) {
+				join_response_timeout();
+			}
+		} else if (current_state == NODE_REGISTERED) {
+			if (data_collection_active &&
+			    (k_timer_status_get(&data_timer) > 0)) {
+				data_timer_expired();
+			}
 		}
 	}
 }
@@ -2831,7 +3919,7 @@ static void run_probe_sender(void)
 
 
 /* =========================================================
- * Root node (transitional probe listener / heartbeat reply)
+ * Root node loop (PROBE reply + join allocation)
  * ========================================================= */
 
 #if NODE_ROLE == ROLE_ROOT
@@ -2841,7 +3929,7 @@ static void run_probe_receiver(void)
 	struct received_frame frame;
 	int ret;
 
-	LOG_INF("Probe receiver started (root)");
+	LOG_INF("Root started (HEARTBEAT + JOIN allocation)");
 	log_node_state("Root loop");
 	LOG_INF(
 		"Local       = %u:%u (0x%04X)",
@@ -2849,9 +3937,10 @@ static void run_probe_receiver(void)
 		(unsigned int)ADDRESS_NODE(local_address),
 		(unsigned int)local_address
 	);
-	LOG_INF("Waiting for PROBE packets...");
+	LOG_INF("Waiting for PROBE / JOIN_REQUEST / JOIN_ACK...");
 
 	while (1) {
+		address_table_check_timeouts();
 
 		ret = k_msgq_get(
 			&receive_queue,
@@ -3283,7 +4372,7 @@ int main(void)
 
 #elif NODE_ROLE == ROLE_ROOT
 
-	LOG_INF("Root will listen for probes (REGISTERED)");
+	LOG_INF("Root will answer probes and allocate join addresses");
 
 	run_probe_receiver();
 
