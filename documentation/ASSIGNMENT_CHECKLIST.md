@@ -224,6 +224,8 @@ Then (registered): periodic **DATA** toward root.
 
 ## 5. Root address allocation
 
+**Doc:** `documentation/SECTION5_ADDRESS_ALLOCATION.md`
+
 ```c
 struct address_record {
     uint16_t address;
@@ -266,13 +268,17 @@ struct address_record {
 
 ## 7. Implementation milestones (assignment §11)
 
+Host-side dry-run (no radio): `python Host/milestone_sim.py`  
+Single milestone: `python Host/milestone_sim.py --milestone N`  
+Doc: `documentation/MILESTONE_SIM.md`
+
 - [x] **M1** Packet format — serialization, version checks, types 1–8, parent/assigned/hop *(see §3 / `SECTION3_MESSAGE_TYPES.md`)*
 - [x] **M2** Discovery — PROBE + HEARTBEAT *(broadcast + registered reply)*
 - [x] **M3** Parent selection — joining node selects and records eligible parent
 - [x] **M4** Address assignment — root JOIN_REQUEST → unique JOIN_RESPONSE
 - [x] **M5** Registration — apply address + JOIN_ACKNOWLEDGE exchange
 - [x] **M6** Data collection — registered nodes send/forward DATA to root
-- [~] **M7** Reliability — join retries + pending release + DATA gap logs; full demo suite still open
+- [x] **M7** Reliability — timeouts, retransmit, duplicate handling, pending release, DATA gaps *(sim PASS; hardware demo still open)*
 
 ---
 
@@ -364,7 +370,7 @@ Logs should clearly show when relevant:
 | Join request and response | 20 | [x] TX/RX + allocation |
 | Address allocation | 15 | [x] Root table + pending/active |
 | Join acknowledgment and state transitions | 10 | [x] REGISTERED + ACK activate |
-| Reliability and duplicate handling | 10 | [~] Join retries + nonce duplicates + DATA gaps; expand demos |
+| Reliability and duplicate handling | 10 | [x] Sim M7 PASS (retries/dup/pending/gaps); hardware logs open |
 | Testing and documentation | 5 | [~] §4 doc done; hardware tests open |
 | **Total** | **100** | |
 
@@ -398,9 +404,9 @@ Use this as the working sequence:
 | Node FSM | **Done** (join-driven; see `SECTION2_NODE_FSM.md` + `SECTION4_PROTOCOL_FLOW.md`) |
 | Parent selection | **Done** |
 | Join request / response / ack | **Done** |
-| Root address allocation table | **Done** (see §5) |
+| Root address allocation table | **Done** (see §5 / `SECTION5_ADDRESS_ALLOCATION.md`) |
 | DATA collection + forwarding | **Done** (1 Hz + parent forward + root missing-seq) |
-| Join reliability / duplicates | **Basic path done; fuller demos open** |
-| Demo, tests, docs, Wireshark | **§4 doc done; hardware demo open** |
+| Join reliability / duplicates | **Sim M7 PASS; hardware evidence open** |
+| Demo, tests, docs, Wireshark | **Host sim done; hardware demo open** |
 
-**Bottom line:** §4.1–4.7 complete — join through `REGISTERED` plus 1 Hz DATA to root. Next: hardware demo / Wireshark / writeup.
+**Bottom line:** M1–M7 logic verified via `Host/milestone_sim.py` (ALL PASS). Next: hardware demo (1 root + ≥2 nodes) / Wireshark / writeup.

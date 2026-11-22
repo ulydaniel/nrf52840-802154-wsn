@@ -2636,7 +2636,19 @@ static void join_response_timeout(void)
 		(unsigned int)JOIN_REQUEST_MAX_RETRIES
 	);
 
-	(void)send_join_request();
+	/*
+	 * If the radio TX fails, restart the join timer so we are
+	 * not stuck forever in WAITING_FOR_JOIN_RESPONSE with no
+	 * outstanding deadline. Exhausted retries still revert.
+	 */
+	if (send_join_request()) {
+		LOG_ERR("JOIN_REQUEST retransmit failed; restarting join timer");
+		k_timer_start(
+			&join_timer,
+			K_SECONDS(JOIN_RESPONSE_TIMEOUT_SECONDS),
+			K_NO_WAIT
+		);
+	}
 }
 
 static int send_join_acknowledge(
@@ -3239,8 +3251,9 @@ static void handle_heartbeat(
 
 /*
  * JOIN_REQUEST: root validates, allocates (or finds pending),
- * and transmits JOIN_RESPONSE. Duplicate requests from the same
- * MAC retransmit the original assignment — never a second address.
+ * and transmits JOIN_RESPONSE. Duplicate requests with the same
+ * join nonce retransmit the original assignment — never a second
+ * address (nonce distinguishes concurrent 0xFFFE joiners).
  */
 static void handle_join_request(
 	const struct oz_packet *packet,
@@ -3689,7 +3702,20 @@ static void process_frame(const struct received_frame *frame)
 	}
 
 	if (!deserialize_packet(frame->data, OZ_PACKET_SIZE, &packet)) {
-		LOG_INF("Non-OZ packet ignored");
+		/* §6: invalid signature / version → ignore + diagnostic. */
+		if ((frame->data[0] != 'O') || (frame->data[1] != 'Z')) {
+			LOG_INF(
+				"Invalid packet ignored: bad signature 0x%02X 0x%02X",
+				(unsigned int)frame->data[0],
+				(unsigned int)frame->data[1]
+			);
+		} else {
+			LOG_INF(
+				"Invalid packet ignored: bad version %u (expected %u)",
+				(unsigned int)frame->data[2],
+				(unsigned int)PROTOCOL_VERSION
+			);
+		}
 		return;
 	}
 
