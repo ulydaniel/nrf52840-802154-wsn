@@ -309,6 +309,8 @@ Logs should clearly show when relevant:
 
 ## 9. Required test cases (§13)
 
+**How-to:** `documentation/TEST_CASES_HOWTO.md` (setup, RTT pass criteria, RF tips, sim fallbacks)
+
 - [ ] **Test 1:** Single-node join — one unregistered node joins successfully
 - [ ] **Test 2:** Multiple nodes — three or more nodes receive unique addresses
 - [ ] **Test 3:** Simultaneous join — two nodes request at approximately the same time
