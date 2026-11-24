@@ -23,7 +23,8 @@
  * Protocol flow (assignment §4.1–4.6):
  *
  *      Joining (PROBING)  --PROBE broadcast-->  Registered node
- *      Joining (PROBING)  <-HEARTBEAT---------  Registered node
+ *      Joining (PROBING)  <-HEARTBEAT (MAC broadcast; OZ dest=joiner)--
+ *                           Registered node
  *      Joining selects parent (lowest hop, then strongest RSSI,
  *      then lowest address), then:
  *      Joining (WAITING)  --JOIN_REQUEST----->  Root
@@ -110,7 +111,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  * ROLE_JOINING  — starts unassigned; gets 1:1..1:253 via join
  */
 
-#define NODE_ROLE         ROLE_JOINING
+#define NODE_ROLE         ROLE_ROOT
 
 
 /* =========================================================
@@ -702,14 +703,19 @@ static bool address_is_for_me(uint16_t destination)
  * short-address register. Used at boot and again when join
  * assigns a new address (platform requirement).
  *
- * Note: after PAN ID + short address are both set, Zephyr may
- * treat the node as associated and reject further parameter
- * changes with -EBUSY. Callers that need a later change must
- * be prepared to bring the interface down or reconfigure.
+ * Zephyr treats (PAN ID set + short != 0xFFFF) as associated.
+ * Booting a joiner at 0xFFFE with a PAN ID already counts as
+ * associated, so a later SET_SHORT_ADDR(1:n) returns -EBUSY.
+ * The only allowed change while associated is SET_SHORT_ADDR to
+ * IEEE802154_SHORT_ADDRESS_NOT_ASSOCIATED (0xFFFF), which clears
+ * both short address and PAN ID. We then restore the PAN and set
+ * the new short address (see ieee802154_mgmt.c).
  */
 static int ieee802154_apply_short_address(uint16_t addr)
 {
 	uint16_t value = addr;
+	uint16_t disassociate = IEEE802154_SHORT_ADDRESS_NOT_ASSOCIATED;
+	uint16_t pan_id = IEEE802154_PAN_ID;
 	int ret;
 
 	if (iface == NULL) {
@@ -722,6 +728,54 @@ static int ieee802154_apply_short_address(uint16_t addr)
 		&value,
 		sizeof(value)
 	);
+
+	if ((ret == -EBUSY) || (ret == EBUSY)) {
+		LOG_WRN(
+			"SET_SHORT_ADDR (0x%04X) busy; disassociate then retry",
+			(unsigned int)addr
+		);
+
+		/*
+		 * Disassociate: only this short-addr value is accepted
+		 * while associated; it also clears the PAN ID.
+		 */
+		ret = net_mgmt(
+			NET_REQUEST_IEEE802154_SET_SHORT_ADDR,
+			iface,
+			&disassociate,
+			sizeof(disassociate)
+		);
+		if (ret) {
+			LOG_ERR(
+				"Disassociate SET_SHORT_ADDR (0x%04X) failed: %d",
+				(unsigned int)disassociate,
+				ret
+			);
+			return ret;
+		}
+
+		ret = net_mgmt(
+			NET_REQUEST_IEEE802154_SET_PAN_ID,
+			iface,
+			&pan_id,
+			sizeof(pan_id)
+		);
+		if (ret) {
+			LOG_ERR(
+				"SET_PAN_ID (0x%04X) after disassociate failed: %d",
+				(unsigned int)pan_id,
+				ret
+			);
+			return ret;
+		}
+
+		ret = net_mgmt(
+			NET_REQUEST_IEEE802154_SET_SHORT_ADDR,
+			iface,
+			&value,
+			sizeof(value)
+		);
+	}
 
 	if (ret) {
 		LOG_ERR(
@@ -740,6 +794,26 @@ static int ieee802154_apply_short_address(uint16_t addr)
 	);
 
 	return 0;
+}
+
+/*
+ * Choose a MAC destination for a peer that is still unassigned.
+ *
+ * IEEE 802.15.4 treats 0xFFFE as "no short address": radios
+ * configured with that short address typically do not accept
+ * unicasts to 0xFFFE. LL source recovery may also report 0xFFFF
+ * when the stack omits a short source. In both cases broadcast
+ * is the reliable way to reach pre-registration joiners.
+ */
+static uint16_t mac_dest_for_unassigned_peer(uint16_t mac_source)
+{
+	if (address_is_broadcast(mac_source) ||
+	    address_is_unassigned(mac_source) ||
+	    (mac_source == 0U)) {
+		return BROADCAST_ADDRESS;
+	}
+
+	return mac_source;
 }
 
 #if NODE_ROLE == ROLE_JOINING
@@ -3073,6 +3147,10 @@ static void print_link_stats(void)
  * heartbeat header echoes the probe sequence and carries the
  * RSSI at which the probe was received; the heartbeat body
  * carries GUID, battery level and heartbeat sequence.
+ *
+ * MAC destination is broadcast so unassigned joiners (short
+ * address 0xFFFE) still receive the frame; see
+ * mac_dest_for_unassigned_peer() / 11-23-code-report.md.
  */
 static void handle_probe(
 	const struct oz_packet *packet,
@@ -3123,13 +3201,17 @@ static void handle_probe(
 	print_packet("HEARTBEAT TX", &heartbeat);
 	print_heartbeat_body("HEARTBEAT TX BODY", &body, heartbeat.value);
 
-	/* ret = send_oz_packet(&heartbeat, packet->source_id); */
-
+	/*
+	 * OZ destination stays the probe source (usually 0xFFFE) so
+	 * only unassigned joiners accept at the app filter. MAC must
+	 * not unicast to 0xFFFE: that address is filtered out by
+	 * 802.15.4 RX on unassigned nodes (see helper).
+	 */
 	ret = send_oz_packet_with_body(
 		&heartbeat,
 		body_buffer,
 		sizeof(body_buffer),
-		packet->source_id
+		mac_dest_for_unassigned_peer(packet->source_id)
 	);
 	link_stats.heartbeats_sent++;
 	if (ret) {
@@ -3327,7 +3409,7 @@ static void handle_join_request(
 		(void)send_join_response_for_record(
 			record,
 			packet->sequence,
-			frame->mac_source
+			mac_dest_for_unassigned_peer(frame->mac_source)
 		);
 		return;
 	}
@@ -3356,7 +3438,7 @@ static void handle_join_request(
 	(void)send_join_response_for_record(
 		record,
 		packet->sequence,
-		frame->mac_source
+		mac_dest_for_unassigned_peer(frame->mac_source)
 	);
 #else
 	ARG_UNUSED(frame);
